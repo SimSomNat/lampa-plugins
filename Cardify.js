@@ -10,9 +10,23 @@
     var STORE = Object.create(null);
 
     if (_add){
+      // Wrap the original Template.add so we can cache the template HTML locally.
+      // This ensures our Template.render polyfill can find templates even if
+      // Lampa’s internal implementation changes or is undefined when our
+      // plugin executes.
       T.add = function(name, html){
         STORE[name] = html;
         return _add(name, html);
+      };
+    }
+    else {
+      // If there is no native add() method available we still need a way to
+      // register templates.  Simply store the markup in our local STORE so
+      // render() can retrieve it later.  Without this branch the calls to
+      // Lampa.Template.add() would silently do nothing, causing our
+      // templates and styles not to be applied.
+      T.add = function(name, html){
+        STORE[name] = html;
       };
     }
 
@@ -300,7 +314,13 @@
 
     /* ========= 4) Подписка ========= */
     Lampa.Listener.follow('full', function (evt) {
-      if (evt && evt.type === 'complite') updateBackdropWithObserver(evt.object);
+      // Handle both possible spellings for the completion event.  Historically some
+      // builds of Lampa emit `complite` (typo), while others emit the correct
+      // `complete`.  Supporting both ensures the backdrop update triggers on
+      // every full-screen rendering.
+      if (evt && (evt.type === 'complite' || evt.type === 'complete')) {
+        updateBackdropWithObserver(evt.object);
+      }
     });
   }
 
