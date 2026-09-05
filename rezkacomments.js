@@ -12,41 +12,95 @@
     return { host, cookie, proxy };
   }
 
-  function makeUrl(path) {
-    let { host, proxy } = getSettings();
-    let target = host + path;
-    if (!proxy) return target;
-    let p = proxy.endsWith('/') ? proxy : proxy + '/';
-    return p + target;
+  // Отдельный тип ошибки, чтобы отличать содержательный ответ воркера
+  // (blocked / not ok с готовым текстом) от обычного JS/сетевого исключения.
+  function RezkaProxyError(message, details) {
+    this.name = 'RezkaProxyError';
+    this.message = message;
+    this.details = details || null;
   }
+  RezkaProxyError.prototype = Object.create(Error.prototype);
 
-  function getHeaders(referer) {
-    let { cookie } = getSettings();
+  /**
+   * Единая точка сетевых запросов к Rezka.
+   *
+   * path    — относительный путь ("/search/?..." или "/ajax/get_comments/?...")
+   * referer — что подставить в Referer (обычно url страницы фильма на Rezka)
+   *
+   * Возвращает СЫРОЙ текст тела ответа (HTML либо JSON-строку из /ajax/),
+   * как и раньше — чтобы DOMParser/JSON.parse выше по стеку не переписывать.
+   *
+   * Если Rezka вернула блокировку (Anubis/Cloudflare/403/404/5xx) —
+   * бросает RezkaProxyError с готовым для показа пользователю текстом.
+   */
+  async function rezkaFetch(path, referer) {
+    let { host, cookie, proxy } = getSettings();
+    let target = host + path;
+
+    // --- Основной режим: через Cloudflare Worker ---
+    if (proxy) {
+      let p = proxy.endsWith('/') ? proxy : proxy + '/';
+      // ВАЖНО: target передаётся как значение query-параметра, а не
+      // приклеивается к пути воркера — это исключает схлопывание "//"
+      // в "/" на спецсимволах и слэшах внутри поискового запроса.
+      let requestUrl = p + '?url=' + encodeURIComponent(target);
+
+      let headers = {};
+      if (cookie) headers['x-cookie'] = cookie;
+      headers['x-referer'] = referer || (host + '/');
+
+      let response = await fetch(requestUrl, { method: 'GET', headers: headers });
+
+      if (!response.ok) {
+        // Ошибка самого воркера (плохой url, хост не разрешён, сеть) —
+        // такие случаи воркер отдаёт настоящим HTTP-кодом 400/502.
+        let details = null;
+        try { details = await response.json(); } catch (e) {}
+        throw new RezkaProxyError(
+          (details && details.message) || ('Прокси вернул ошибку HTTP ' + response.status),
+          details
+        );
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (e) {
+        throw new RezkaProxyError('Прокси вернул не-JSON ответ. Проверьте адрес воркера в настройках.', null);
+      }
+
+      if (data.blocked || !data.ok) {
+        throw new RezkaProxyError(
+          data.message || ('Rezka вернула HTTP ' + data.status),
+          data
+        );
+      }
+
+      return data.body;
+    }
+
+    // --- Fallback без прокси: сработает только если окружение не блокирует CORS ---
     let headers = {};
-    if (cookie) headers["x-cookie"] = cookie;
-    if (referer) headers["x-referer"] = referer;
-    return headers;
+    if (cookie) headers['x-cookie'] = cookie;
+    if (referer) headers['x-referer'] = referer;
+
+    let response = await fetch(target, { method: 'GET', headers: headers });
+    let fc = await response.text();
+
+    if (response.status === 403 || fc.includes('Проверяем, что вы не бот') || fc.includes('Anubis')) {
+      throw new RezkaProxyError('Rezka требует защиты Anubis. Обновите Cookie в настройках.', { status: response.status });
+    }
+    if (!response.ok) {
+      throw new RezkaProxyError('HTTP статус ' + response.status, { status: response.status });
+    }
+
+    return fc;
   }
 
   async function searchRezka(name, ye) {
     try {
       let path = "/search/?do=search&subaction=search&q=" + encodeURIComponent(name) + (ye ? "+" + ye : "");
-      let searchUrl = makeUrl(path);
-
-      let response = await fetch(searchUrl, {
-        method: "GET",
-        headers: getHeaders()
-      });
-
-      let fc = await response.text();
-
-      if (response.status === 403 || fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
-        Lampa.Noty.show('Rezka требует защиты Anubis. Обновите Cookie в настройках.');
-        Lampa.Loading.stop();
-        return;
-      }
-
-      if (!response.ok) throw new Error('HTTP status ' + response.status);
+      let fc = await rezkaFetch(path);
 
       let dom = new DOMParser().parseFromString(fc, "text/html");
       const item = dom.querySelector(".b-content__inline_item");
@@ -61,7 +115,7 @@
       let itemUrl = item.querySelector(".b-content__inline_item-link")?.getAttribute("href") || "";
       await comment_rezka(item.dataset.id, itemUrl);
     } catch (e) {
-      console.error('[RezkaComment] searchRezka error:', e);
+      console.error('[RezkaComment] searchRezka error:', e, e.details);
       Lampa.Noty.show('Ошибка поиска: ' + e.message);
       Lampa.Loading.stop();
     }
@@ -162,22 +216,7 @@
     try {
       let t = Date.now();
       let path = "/ajax/get_comments/?t=" + t + "&news_id=" + (id || "1") + "&cstart=1&type=0&comment_id=0&skin=hdrezka";
-      let commentsUrl = makeUrl(path);
-
-      let response = await fetch(commentsUrl, {
-        method: "GET",
-        headers: getHeaders(pageUrl)
-      });
-
-      let fc = await response.text();
-
-      if (response.status === 403 || fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
-        Lampa.Noty.show('Rezka требует защиты Anubis. Обновите Cookie в настройках.');
-        Lampa.Loading.stop();
-        return;
-      }
-
-      if (!response.ok) throw new Error('HTTP status ' + response.status);
+      let fc = await rezkaFetch(path, pageUrl);
 
       let json = JSON.parse(fc);
       if (!json || !json.comments) throw new Error('Пустой ответ от сервера');
@@ -194,7 +233,7 @@
 
       openModal(buildTree(rootList));
     } catch (e) {
-      console.error('[RezkaComment] comment_rezka error:', e);
+      console.error('[RezkaComment] comment_rezka error:', e, e.details);
       Lampa.Noty.show('Ошибка получения комментариев: ' + e.message);
       Lampa.Loading.stop();
     }
@@ -296,13 +335,13 @@
         param: {
           name: 'rezka_comment_proxy',
           type: 'input',
-          placeholder: 'https://misty-haze-...workers.dev/',
+          placeholder: 'https://worker-domain.workers.dev/',
           values: Lampa.Storage.get('rezka_comment_proxy', ''),
           default: ''
         },
         field: {
           name: 'CORS Прокси',
-          description: 'Ваш Cloudflare Worker (обязательно с / на конце)'
+          description: 'Ваш Cloudflare Worker (обязательно с / на конце). В WebView практически всегда нужен — прямой запрос почти наверняка упадёт на CORS.'
         },
         onChange: function(value) {
           Lampa.Storage.set('rezka_comment_proxy', value);
