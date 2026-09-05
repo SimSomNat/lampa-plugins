@@ -12,41 +12,47 @@
     return { host, cookie, proxy };
   }
 
-  // Формирование URL с учетом прокси (если пустой — запрос идет напрямую)
-  function makeUrl(path, referer) {
-    let { host, cookie, proxy } = getSettings();
+  function makeUrl(path) {
+    let { host, proxy } = getSettings();
     let target = host + path;
     if (!proxy) return target;
-
-    let url = proxy.endsWith('/') ? proxy : proxy + '/';
-    if (cookie) url += "param/Cookie=" + encodeURIComponent(cookie) + "/";
-    if (referer) url += "param/Referer=" + encodeURIComponent(referer) + "/";
-    return url + target;
+    let p = proxy.endsWith('/') ? proxy : proxy + '/';
+    return p + target;
   }
 
-  // Поиск на hdrezka
+  function getHeaders(referer) {
+    let { cookie } = getSettings();
+    let headers = {};
+    if (cookie) headers["x-cookie"] = cookie;
+    if (referer) headers["x-referer"] = referer;
+    return headers;
+  }
+
   async function searchRezka(name, ye) {
     try {
       let path = "/search/?do=search&subaction=search&q=" + encodeURIComponent(name) + (ye ? "+" + ye : "");
       let searchUrl = makeUrl(path);
 
-      let fc = await fetch(searchUrl, {
+      let response = await fetch(searchUrl, {
         method: "GET",
-        headers: { "Content-Type": "text/html" }
-      }).then((response) => {
-        if (!response.ok) throw new Error('HTTP status ' + response.status);
-        return response.text();
+        headers: getHeaders()
       });
+
+      let fc = await response.text();
+
+      if (response.status === 403 || fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
+        Lampa.Noty.show('Rezka требует защиты Anubis. Обновите Cookie в настройках.');
+        Lampa.Loading.stop();
+        return;
+      }
+
+      if (!response.ok) throw new Error('HTTP status ' + response.status);
 
       let dom = new DOMParser().parseFromString(fc, "text/html");
       const item = dom.querySelector(".b-content__inline_item");
 
       if (!item) {
-        if (fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
-          Lampa.Noty.show('Защита от ботов на Rezka. Укажите Cookie в настройках.');
-        } else {
-          Lampa.Noty.show('Фильм/сериал не найден на Rezka');
-        }
+        Lampa.Noty.show('Фильм/сериал не найден на Rezka');
         Lampa.Loading.stop();
         return;
       }
@@ -61,7 +67,6 @@
     }
   }
 
-  // Получение названия: пробует TMDB, если сбой — берет оригинальное/обычное название из карточки
   async function resolveAndSearch(movie, method) {
     let queryTitle = movie.original_title || movie.original_name || movie.title || movie.name;
 
@@ -157,21 +162,22 @@
     try {
       let t = Date.now();
       let path = "/ajax/get_comments/?t=" + t + "&news_id=" + (id || "1") + "&cstart=1&type=0&comment_id=0&skin=hdrezka";
-      let commentsUrl = makeUrl(path, pageUrl);
+      let commentsUrl = makeUrl(path);
 
-      let fc = await fetch(commentsUrl, {
+      let response = await fetch(commentsUrl, {
         method: "GET",
-        headers: { "Content-Type": "text/plain" },
-      }).then((r) => {
-        if (!r.ok) throw new Error('HTTP status ' + r.status);
-        return r.text();
+        headers: getHeaders(pageUrl)
       });
 
-      if (fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
-        Lampa.Noty.show('Защита от ботов на Rezka. Укажите Cookie в настройках.');
+      let fc = await response.text();
+
+      if (response.status === 403 || fc.includes("Проверяем, что вы не бот") || fc.includes("Anubis")) {
+        Lampa.Noty.show('Rezka требует защиты Anubis. Обновите Cookie в настройках.');
         Lampa.Loading.stop();
         return;
       }
+
+      if (!response.ok) throw new Error('HTTP status ' + response.status);
 
       let json = JSON.parse(fc);
       if (!json || !json.comments) throw new Error('Пустой ответ от сервера');
@@ -272,13 +278,13 @@
         param: {
           name: 'rezka_comment_cookie',
           type: 'input',
-          placeholder: 'вставьте cookie',
+          placeholder: 'Вставьте полные куки',
           values: Lampa.Storage.get('rezka_comment_cookie', ''),
           default: ''
         },
         field: {
           name: 'Cookie авторизации',
-          description: 'Cookie для обхода защиты (Anubis / PHPSESSID)'
+          description: 'Полная строка document.cookie из браузера'
         },
         onChange: function(value) {
           Lampa.Storage.set('rezka_comment_cookie', value);
@@ -290,13 +296,13 @@
         param: {
           name: 'rezka_comment_proxy',
           type: 'input',
-          placeholder: 'оставьте пустым для прямого подключения',
+          placeholder: 'https://misty-haze-...workers.dev/',
           values: Lampa.Storage.get('rezka_comment_proxy', ''),
           default: ''
         },
         field: {
-          name: 'CORS Прокси (необязательно)',
-          description: 'Оставьте пустым, если запросы идут напрямую'
+          name: 'CORS Прокси',
+          description: 'Ваш Cloudflare Worker (обязательно с / на конце)'
         },
         onChange: function(value) {
           Lampa.Storage.set('rezka_comment_proxy', value);
