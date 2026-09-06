@@ -93,13 +93,13 @@
     function hasCustomRezkaMirror() {
         if (typeof Lampa === 'undefined' || !Lampa.Storage) return false;
         var m = (Lampa.Storage.get('online_mod_rezka2_mirror', '') + '').trim();
-        return !!m && m !== 'https://rezka.ag';
+        return !!m && m !== 'https://rezka.ag' && m !== 'https://kvk.zone';
     }
 
     // Get active HDrezka mirror
     function getRezkaMirror() {
         var mirror = (Lampa.Storage.get('online_mod_rezka2_mirror', '') + '').trim();
-        if (!mirror) return 'https://rezka.ag';
+        if (!mirror || mirror === 'https://rezka.ag' || mirror === 'http://rezka.ag') return 'https://kvk.zone';
         if (mirror.indexOf('://') === -1) mirror = 'https://' + mirror;
         if (mirror.charAt(mirror.length - 1) === '/') mirror = mirror.substring(0, mirror.length - 1);
         return mirror;
@@ -138,8 +138,8 @@
     function getProxy(type) {
         var myIp = getMyIp() || '';
         var ipParam = Lampa.Storage.field('online_mod_proxy_find_ip') === true ? 'ip' + myIp + '/' : '';
-        var workerProxy = (new Date().getHours() % 2) ? 'https://cors.fx666.workers.dev/' : 'https://cors557.deno.dev/';
-        var defaultWorker = 'https://cors.nb557.workers.dev/';
+        var defaultWorker = 'https://iqslgbok.deploy.cx/';
+        var workerProxy = 'https://iqslgbok.deploy.cx/';
         var ipWorker = defaultWorker + (ipParam ? '' : 'ip/');
         
         var customProxyActive = Lampa.Storage.field('online_mod_proxy_other') === true;
@@ -418,7 +418,7 @@
         var extra = '';
         var isPlatformAndroid = isAndroid;
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
-        var host = hasCustomRezkaMirror() ? getRezkaMirror() : ((proxy && !proxyMirror) ? 'https://rezka.ag' : getRezkaMirror());
+        var host = getRezkaMirror();
 
         if (!proxy && !isPlatformAndroid && !hasCustomRezkaMirror()) proxy = getProxy('cookie');
         if (!proxy && !isPlatformAndroid && !hasCustomRezkaMirror()) {
@@ -615,7 +615,7 @@
         var mirror = getRezkaMirror();
         var proxy = getProxy('rezka2');
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
-        var host = hasCustomRezkaMirror() ? mirror : ((proxy && !proxyMirror) ? 'https://rezka.ag' : mirror);
+        var host = getRezkaMirror();
         var url = host + '/ajax/login/';
         var postData = 'login_name=' + encodeURIComponent(loginName);
         postData += '&login_password=' + encodeURIComponent(loginPassword);
@@ -692,7 +692,7 @@
         var preferMp4 = Lampa.Storage.field('online_mod_prefer_mp4') === true;
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
         var proxyHost = component.proxy('rezka2');
-        var mirror = hasCustomRezkaMirror() ? getRezkaMirror() : ((proxyHost && !proxyMirror) ? 'https://rezka.ag' : getRezkaMirror());
+        var mirror = getRezkaMirror();
         var mirrorSlash = mirror + '/';
         var withCreds = !(proxyHost || isAndroid);
         var uAgent = baseUserAgent();
