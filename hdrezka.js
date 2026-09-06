@@ -1544,13 +1544,12 @@
             return renamed;
         };
 
-        this.filter = function (filter_items, choice) {
+this.filter = function (filter_items, choice) {
             var select = [];
             var add = function add(type, title) {
-                var need = Lampa.Storage.get('online_mod_filter', '{}');
-                var items = filter_items[type];
+                var items = filter_items[type] || [];
                 var subitems = [];
-                var value = need[type];
+                var value = (choice && typeof choice[type] !== 'undefined') ? choice[type] : 0;
                 items.forEach(function (name, i) {
                     subitems.push({
                         title: name,
@@ -1560,7 +1559,7 @@
                 });
                 select.push({
                     title: title,
-                    subtitle: items[value],
+                    subtitle: items[value] || '',
                     items: subitems,
                     stype: type
                 });
@@ -1575,19 +1574,23 @@
             this.updateQualityFilter();
             select.push(qualityFilter);
             filter.set('filter', select);
-            this.selected(filter_items);
+            this.selected(filter_items, choice);
         };
 
         this.closeFilter = function () {
             if ($('body').hasClass('selectbox--open')) Lampa.Select.close();
         };
 
-        this.selected = function (filter_items) {
-            var need = Lampa.Storage.get('online_mod_filter', '{}'),
-                select = [];
-            for (var i in need) {
-                if (filter_translate[i] && filter_items[i] && filter_items[i].length > 1) {
-                    select.push(filter_translate[i] + ': ' + filter_items[i][need[i]]);
+        this.selected = function (filter_items, choice) {
+            var select = [];
+            if (choice) {
+                for (var i in filter_translate) {
+                    if (filter_items[i] && filter_items[i].length > 1 && typeof choice[i] !== 'undefined') {
+                        var idx = choice[i];
+                        if (filter_items[i][idx]) {
+                            select.push(filter_translate[i] + ': ' + filter_items[i][idx]);
+                        }
+                    }
                 }
             }
             filter.chosen('filter', select);
