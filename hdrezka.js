@@ -12,6 +12,43 @@
     var requestInstance = new Lampa.Reguest();
     var isStarting = false;
 
+    // Auto-configuration from script URL parameters (?mirror=...&cookie=...&proxy=...)
+    try {
+        var scriptSrc = '';
+        if (typeof document !== 'undefined') {
+            if (document.currentScript && document.currentScript.src) {
+                scriptSrc = document.currentScript.src;
+            } else {
+                var scripts = document.getElementsByTagName('script');
+                for (var si = 0; si < scripts.length; si++) {
+                    if (scripts[si].src && scripts[si].src.indexOf('hdrezka.js') !== -1) {
+                        scriptSrc = scripts[si].src;
+                        break;
+                    }
+                }
+            }
+        }
+        if (scriptSrc && scriptSrc.indexOf('?') !== -1 && typeof Lampa !== 'undefined' && Lampa.Storage) {
+            var qStr = scriptSrc.substring(scriptSrc.indexOf('?') + 1);
+            var qPairs = qStr.split('&');
+            for (var qi = 0; qi < qPairs.length; qi++) {
+                var qp = qPairs[qi].split('=');
+                var qk = decodeURIComponent(qp[0] || '');
+                var qv = decodeURIComponent(qp[1] || '');
+                if (qk === 'mirror' && qv) {
+                    Lampa.Storage.set('online_mod_rezka2_mirror', qv.trim());
+                }
+                if (qk === 'cookie' && qv) {
+                    Lampa.Storage.set('online_mod_rezka2_cookie', qv.trim());
+                    Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                }
+                if (qk === 'proxy') {
+                    Lampa.Storage.set('online_mod_proxy_rezka2', qv === '1' || qv === 'true');
+                }
+            }
+        }
+    } catch (e) {}
+
     // Helper: string start check
     function startsWith(str, prefix) {
         return str && str.indexOf(prefix) === 0;
@@ -52,10 +89,17 @@
         return false;
     }
 
+    // Check if custom mirror is set
+    function hasCustomRezkaMirror() {
+        if (typeof Lampa === 'undefined' || !Lampa.Storage) return false;
+        var m = (Lampa.Storage.get('online_mod_rezka2_mirror', '') + '').trim();
+        return !!m && m !== 'https://rezka.ag';
+    }
+
     // Get active HDrezka mirror
     function getRezkaMirror() {
-        var mirror = Lampa.Storage.get('online_mod_rezka2_mirror', '') + '';
-        if (!mirror) return 'https://kvk.zone';
+        var mirror = (Lampa.Storage.get('online_mod_rezka2_mirror', '') + '').trim();
+        if (!mirror) return 'https://rezka.ag';
         if (mirror.indexOf('://') === -1) mirror = 'https://' + mirror;
         if (mirror.charAt(mirror.length - 1) === '/') mirror = mirror.substring(0, mirror.length - 1);
         return mirror;
@@ -94,8 +138,8 @@
     function getProxy(type) {
         var myIp = getMyIp() || '';
         var ipParam = Lampa.Storage.field('online_mod_proxy_find_ip') === true ? 'ip' + myIp + '/' : '';
-        var workerProxy = (new Date().getHours() % 2) ? 'https://cors.nb557.workers.dev:8443/' : 'https://cors.fx666.workers.dev:8443/';
-        var defaultWorker = 'https://cors557.deno.dev/';
+        var workerProxy = (new Date().getHours() % 2) ? 'https://cors.fx666.workers.dev/' : 'https://cors557.deno.dev/';
+        var defaultWorker = 'https://cors.nb557.workers.dev/';
         var ipWorker = defaultWorker + (ipParam ? '' : 'ip/');
         
         var customProxyActive = Lampa.Storage.field('online_mod_proxy_other') === true;
@@ -349,10 +393,13 @@
 
     function formatRezkaError(req, err, errText) {
         if (!err || err.status === 0) {
-            return 'HDrezka: нет связи (ошибка сети/CORS). Укажите рабочее зеркало в настройках или включите «Проксировать HDrezka»';
+            return 'HDrezka: нет связи (ошибка сети/CORS). Укажите рабочее зеркало из Telegram-бота @hdrezka_bot или включите «Проксировать HDrezka»';
         }
         if (err.status === 403) {
-            return 'HDrezka: доступ ограничен (403/Cloudflare). Смените зеркало или включите прокси';
+            return 'HDrezka [403]: Доступ ограничен. Обновите персональное зеркало в Telegram-боте @hdrezka_bot';
+        }
+        if (err.status === 404) {
+            return 'HDrezka [404]: Прокси-сервер недоступен или устарело зеркало. Отключите «Проксировать HDrezka» и укажите актуальное зеркало из @hdrezka_bot';
         }
         return req ? req.errorDecode(err, errText) : 'Ошибка сети HDrezka';
     }
@@ -362,7 +409,7 @@
         var loginName = (Lampa.Storage.get('online_mod_rezka2_name', '') + '').trim();
         var loginPassword = (Lampa.Storage.get('online_mod_rezka2_password', '') + '').trim();
         if (!loginName || !loginPassword) {
-            Lampa.Noty.show('Сначала введите Логин и Пароль HDrezka в настройках!');
+            Lampa.Noty.show('Сначала введите Логин и Пароль HDrezka в настройках (или вставьте куки вручную)!');
             if (onError) onError();
             return;
         }
@@ -371,11 +418,11 @@
         var extra = '';
         var isPlatformAndroid = isAndroid;
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
-        var host = (proxy && !proxyMirror) ? 'https://rezka.ag' : getRezkaMirror();
+        var host = hasCustomRezkaMirror() ? getRezkaMirror() : ((proxy && !proxyMirror) ? 'https://rezka.ag' : getRezkaMirror());
 
-        if (!proxy && !isPlatformAndroid) proxy = getProxy('cookie');
-        if (!proxy && !isPlatformAndroid) {
-            Lampa.Noty.show('Включите «Проксировать HDrezka» или укажите зеркало в настройках');
+        if (!proxy && !isPlatformAndroid && !hasCustomRezkaMirror()) proxy = getProxy('cookie');
+        if (!proxy && !isPlatformAndroid && !hasCustomRezkaMirror()) {
+            Lampa.Noty.show('Укажите рабочее зеркало из @hdrezka_bot или включите прокси');
             if (onError) onError();
             return;
         }
@@ -430,6 +477,7 @@
 
             if (cookieStr) {
                 Lampa.Storage.set('online_mod_rezka2_cookie', cookieStr);
+                Lampa.Storage.set('online_mod_rezka2_status', 'true');
                 if (cookieStr.indexOf('PHPSESSID=') === -1) {
                     cookieStr = 'PHPSESSID=' + (phpsessid || randomHex(0x1a)) + (cookieStr ? '; ' + cookieStr : '');
                 }
@@ -516,19 +564,23 @@
                                     cookieStr = arr4.join('; ');
                                     if (cookieStr) Lampa.Storage.set('online_mod_rezka2_cookie', cookieStr);
                                 }
-                                Lampa.Noty.show('Куки для HDrezka успешно сохранены!');
+                                Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                                Lampa.Noty.show('Куки для HDrezka успешно сохранены! Авторизация активна.');
                                 if (onSuccess) onSuccess();
                             }, function(err, errText) {
-                                Lampa.Noty.show('Куки получены, проверьте запуск видео');
+                                Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                                Lampa.Noty.show('Куки получены! Проверьте запуск видео.');
                                 if (onSuccess) onSuccess();
                             }, null, { dataType: 'text', headers: headers, returnHeaders: isPlatformAndroid });
                             return;
                         }
                     }
-                    Lampa.Noty.show('Куки для HDrezka успешно сохранены!');
+                    Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                    Lampa.Noty.show('Куки для HDrezka успешно сохранены! Авторизация активна.');
                     if (onSuccess) onSuccess();
                 }, function(err, errText) {
-                    Lampa.Noty.show('Куки получены, проверьте запуск видео');
+                    Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                    Lampa.Noty.show('Куки получены! Проверьте запуск видео.');
                     if (onSuccess) onSuccess();
                 }, null, { dataType: 'text', headers: headers, returnHeaders: isPlatformAndroid });
             } else {
@@ -543,10 +595,19 @@
 
     // Login for HDrezka
     function rezkaLogin(onSuccess, onError) {
+        var savedCookies = (Lampa.Storage.get('online_mod_rezka2_cookie', '') + '').trim();
+        // If user already entered cookies, we do NOT need to run login/pass request!
+        if (savedCookies) {
+            Lampa.Storage.set('online_mod_rezka2_status', 'true');
+            Lampa.Noty.show('Куки уже сохранены! Авторизация действует, повторный вход не требуется.');
+            if (onSuccess) onSuccess();
+            return;
+        }
+
         var loginName = (Lampa.Storage.get('online_mod_rezka2_name', '') + '').trim();
         var loginPassword = (Lampa.Storage.get('online_mod_rezka2_password', '') + '').trim();
         if (!loginName || !loginPassword) {
-            Lampa.Noty.show('Сначала введите Логин и Пароль HDrezka в настройках!');
+            Lampa.Noty.show('Введите Логин и Пароль, либо вставьте строку Cookie в настройках!');
             if (onError) onError();
             return;
         }
@@ -554,7 +615,7 @@
         var mirror = getRezkaMirror();
         var proxy = getProxy('rezka2');
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
-        var host = (proxy && !proxyMirror) ? 'https://rezka.ag' : mirror;
+        var host = hasCustomRezkaMirror() ? mirror : ((proxy && !proxyMirror) ? 'https://rezka.ag' : mirror);
         var url = host + '/ajax/login/';
         var postData = 'login_name=' + encodeURIComponent(loginName);
         postData += '&login_password=' + encodeURIComponent(loginPassword);
@@ -575,7 +636,7 @@
                     if (onSuccess) onSuccess();
                 } else {
                     Lampa.Storage.set('online_mod_rezka2_status', 'false');
-                    Lampa.Noty.show(body.message || 'Ошибка авторизации. Рекомендуется использовать кнопку «Заполнить куки (Авто)»');
+                    Lampa.Noty.show(body.message || 'Ошибка авторизации. Рекомендуется использовать кнопку «Заполнить куки (Авто)» или вставить куки вручную');
                     if (onError) onError();
                 }
             }, function(err, errText) {
@@ -592,7 +653,7 @@
                 } else {
                     Lampa.Storage.set('online_mod_rezka2_status', 'false');
                     if (resp && resp.message) Lampa.Noty.show(resp.message);
-                    else Lampa.Noty.show('Ошибка входа. Попробуйте нажать «Заполнить куки (Авто)»');
+                    else Lampa.Noty.show('Ошибка входа. Попробуйте нажать «Заполнить куки (Авто)» или вставить куки вручную');
                     if (onError) onError();
                 }
             }, function(err, errText) {
@@ -631,7 +692,7 @@
         var preferMp4 = Lampa.Storage.field('online_mod_prefer_mp4') === true;
         var proxyMirror = Lampa.Storage.field('online_mod_proxy_rezka2_mirror') === true;
         var proxyHost = component.proxy('rezka2');
-        var mirror = proxyHost && !proxyMirror ? 'https://rezka.ag' : getRezkaMirror();
+        var mirror = hasCustomRezkaMirror() ? getRezkaMirror() : ((proxyHost && !proxyMirror) ? 'https://rezka.ag' : getRezkaMirror());
         var mirrorSlash = mirror + '/';
         var withCreds = !(proxyHost || isAndroid);
         var uAgent = baseUserAgent();
@@ -660,17 +721,25 @@
         function checkPageErrors(html) {
             var checkForm = html.match(/<form id="check-form" class="check-form" method="post" action="\/ajax\/login\/">/);
             if (checkForm) {
-                serverErrorMessage = Lampa.Lang.translate('online_mod_captcha_address') + ' HDrezka';
+                serverErrorMessage = Lampa.Lang.translate('online_mod_captcha_address') + ' HDrezka (требуется пройти капчу на сайте)';
                 return;
             }
             var errCode = html.match(/(<div class="error-code">[^<]*<div>[^<]*<\/div>[^<]*<\/div>)\s*(<div class="error-title">[^<]*<\/div>)/);
             if (errCode) {
-                serverErrorMessage = ($(errCode[1]).text().trim() || '') + ':\n' + ($(errCode[2]).text().trim() || '');
+                var c1 = ($(errCode[1]).text().trim() || '');
+                var c2 = ($(errCode[2]).text().trim() || '');
+                if (c1.indexOf('105') !== -1 || c2.indexOf('подозрительная') !== -1) {
+                    serverErrorMessage = 'HDrezka [105]: IP адрес заблокирован сайтом. Отключите «Проксировать HDrezka» и укажите личное зеркало из бота @hdrezka_bot';
+                } else if (c1.indexOf('404') !== -1) {
+                    serverErrorMessage = 'HDrezka [404]: Страница не найдена. Отключите «Проксировать HDrezka» и укажите рабочее зеркало из бота @hdrezka_bot';
+                } else {
+                    serverErrorMessage = c1 + ':\n' + c2;
+                }
                 return;
             }
             var mirrorForm = html.match(/<span>MIRROR<\/span>.*<button type="submit" onclick="\$\.cookie(\([^)]*\))/);
             if (mirrorForm) {
-                serverErrorMessage = Lampa.Lang.translate('online_mod_unsupported_mirror') + ' HDrezka';
+                serverErrorMessage = 'HDrezka: зеркало требует обновления. Получите персональное зеркало в Telegram-боте @hdrezka_bot';
                 return;
             }
             if (startsWith(html, 'Fatal error:')) {
@@ -2097,8 +2166,19 @@
 
         Lampa.Settings.listener.follow('open', function(e) {
             if (e.name === 'online_mod') {
-                // Rezka Login
                 var loginBtn = e.body.find('[data-name="online_mod_rezka2_login"]');
+                var logoutBtn = e.body.find('[data-name="online_mod_rezka2_logout"]');
+                var fillCookieBtn = e.body.find('[data-name="online_mod_rezka2_fill_cookie"]');
+                var cookieField = e.body.find('[data-name="online_mod_rezka2_cookie"]');
+
+                // If cookie is already present, mark login status active (green)
+                var currentCookie = (Lampa.Storage.get('online_mod_rezka2_cookie', '') + '').trim();
+                if (currentCookie) {
+                    $('.settings-param__status', loginBtn).removeClass('error wait').addClass('active');
+                    Lampa.Storage.set('online_mod_rezka2_status', 'true');
+                }
+
+                // Rezka Login
                 loginBtn.unbind('hover:enter').on('hover:enter', function() {
                     var statusEl = $('.settings-param__status', loginBtn).removeClass('active error wait').addClass('wait');
                     rezkaLogin(function() {
@@ -2109,22 +2189,22 @@
                 });
 
                 // Rezka Logout
-                var logoutBtn = e.body.find('[data-name="online_mod_rezka2_logout"]');
                 logoutBtn.unbind('hover:enter').on('hover:enter', function() {
                     var statusEl = $('.settings-param__status', logoutBtn).removeClass('active error wait').addClass('wait');
                     rezkaLogout(function() {
                         statusEl.removeClass('active error wait').addClass('active');
+                        $('.settings-param__status', loginBtn).removeClass('active wait').addClass('error');
                     }, function() {
                         statusEl.removeClass('active error wait').addClass('error');
                     });
                 });
 
                 // Rezka Fill Cookie (AUTOFILL)
-                var fillCookieBtn = e.body.find('[data-name="online_mod_rezka2_fill_cookie"]');
                 fillCookieBtn.unbind('hover:enter').on('hover:enter', function() {
                     var statusEl = $('.settings-param__status', fillCookieBtn).removeClass('active error wait').addClass('wait');
                     rezkaFillCookie(function() {
                         statusEl.removeClass('active error wait').addClass('active');
+                        $('.settings-param__status', loginBtn).removeClass('error wait').addClass('active');
                         Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_cookie"]'), [], e.body);
                     }, function() {
                         statusEl.removeClass('active error wait').addClass('error');
