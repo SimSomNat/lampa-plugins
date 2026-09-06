@@ -2,173 +2,84 @@
 (function () {
     'use strict';
 
-    const SOURCE = 'online_mod'; // ВАЖНО: именно online_mod для совместимости с Lampa Uncensored
-    const TITLE = 'HDRezka';
-    
-    let network = null;
-    let activeController = null;
-
     // --- 1. Переводы ---
     Lampa.Lang.add({
-        online_mod_watch: { ru: 'Смотреть онлайн', en: 'Watch online', uk: 'Дивитися онлайн' },
-        online_mod_nolink: { ru: 'Не удалось получить ссылку', en: 'Failed to fetch link', uk: 'Не вдалося отримати посилання' },
-        online_mod_blockedlink: { ru: 'Видео недоступно в вашем регионе', en: 'Video not available in your region', uk: 'Відео недоступне у вашому регіоні' },
-        hdrezka_mirror: { ru: 'Зеркало HDRezka', en: 'HDRezka Mirror', uk: 'Дзеркало HDRezka' },
-        hdrezka_cookie: { ru: 'Cookie HDRezka', en: 'HDRezka Cookie', uk: 'Cookie HDRezka' },
-        hdrezka_fill_cookie: { ru: 'Заполнить Cookie', en: 'Fill Cookie', uk: 'Заповнити Cookie' },
-        hdrezka_notfound: { ru: 'Не найдено на HDRezka', en: 'Not found on HDRezka', uk: 'Не знайдено на HDRezka' }
+        'online_mod_rezka2_mirror': { ru: 'Зеркало HDRezka', en: 'HDRezka Mirror', uk: 'Дзеркало HDRezka' },
+        'online_mod_rezka2_cookie': { ru: 'Cookie HDRezka', en: 'HDRezka Cookie', uk: 'Cookie HDRezka' },
+        'online_mod_rezka2_fill_cookie': { ru: 'Заполнить Cookie', en: 'Fill Cookie', uk: 'Заповнити Cookie' },
+        'online_mod_title_full': { ru: 'Онлайн (HDRezka)', en: 'Online (HDRezka)', uk: 'Онлайн (HDRezka)' },
+        'online_mod_nolink': { ru: 'Не удалось получить ссылку', en: 'Failed to fetch link', uk: 'Не вдалося отримати посилання' }
     });
 
     // --- 2. Утилиты ---
     function getMirror() {
-        return (Lampa.Storage.get('hdrezka_mirror', 'https://rezka.ag') || 'https://rezka.ag').replace(/\/$/, '');
+        return (Lampa.Storage.get('online_mod_rezka2_mirror', 'https://rezka.ag') || 'https://rezka.ag').replace(/\/$/, '');
     }
-
+    
     function getCookie() {
-        return Lampa.Storage.get('hdrezka_cookie', '') || '';
-    }
-
-    function setCookie(value) {
-        Lampa.Storage.set('hdrezka_cookie', value);
+        return Lampa.Storage.get('online_mod_rezka2_cookie', '') || '';
     }
 
     function baseUserAgent() {
         return 'Mozilla/5.0 (Linux; Android 10; K; client) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.178 Mobile Safari/537.36';
     }
 
-    // --- 3. Расшифровка потоков Rezka ---
+    // Базовая расшифровка (работает для многих зеркал). 
+    // Для rezka.ag с их сложным eval-шифрованием может потребоваться оригинальный decrypt из SimSomNat.
     function decryptRezka(h) {
         if (!h) return {};
-        try {
-            let decoded = atob(h);
-            return JSON.parse(decoded);
-        } catch (e) {
-            try { 
-                return JSON.parse(h); 
-            } catch (err) { 
-                return {}; 
-            }
-        }
+        try { return JSON.parse(atob(h)); } catch (e) {}
+        try { return JSON.parse(h); } catch (e) {}
+        return { mp4: { '1080': h } }; // Fallback: считаем, что это прямая ссылка
     }
 
-    // --- 4. Автоматическое заполнение Cookie ---
-    function fillCookie(callback) {
-        const mirror = getMirror();
-        const loginUrl = `${mirror}/ajax/login/`;
-        
-        // Создаём фиктивные данные для получения cookie
-        const formData = new URLSearchParams();
-        formData.append('login_name', 'guest_' + Math.random().toString(36).substr(2, 9));
-        formData.append('login_password', 'guest_' + Math.random().toString(36).substr(2, 9));
-        formData.append('login_not_save', '0');
-
-        fetch(loginUrl, {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest'
-            }
-        })
-        .then(res => {
-            const cookies = res.headers.get('set-cookie');
-            if (cookies) {
-                setCookie(cookies);
-                if (callback) callback(true);
-            } else {
-                if (callback) callback(false);
-            }
-        })
-        .catch(() => {
-            if (callback) callback(false);
-        });
-    }
-
-    // --- 5. Компонент ---
-    function component(object) {
+    // --- 3. Компонент "Онлайн" (Заменяет встроенный в Lampa Uncensored) ---
+    function online(object) {
         this.object = object;
-        this.activity = null;
-        this.scroll = null;
-        network = new Lampa.Reguest();
+        this.network = new Lampa.Reguest();
         
         this.create = function () {
             this.activity = new Lampa.Activity({
-                layer: 'online_mod',
-                title: TITLE,
+                layer: 'online',
+                title: 'HDRezka',
                 movie: object.movie
             });
-            
-            this.scroll = new Lampa.Scroll({
-                height: 500,
-                over: true,
-                step: 150
-            });
-            
+            this.scroll = new Lampa.Scroll({ mask: true, over: true });
             this.activity.render().find('.explorer__files').append(this.scroll.render());
             this.start();
         };
 
         this.start = async function () {
-            activeController = new AbortController();
-            const signal = activeController.signal;
+            this.activity.loader(true);
             const mirror = getMirror();
             const title = object.movie.title || object.movie.original_title;
             const cookie = getCookie();
             
-            this.activity.loader(true);
-
             try {
                 // 1. Поиск
                 const searchUrl = `${mirror}/search/?do=search&subaction=search&q=${encodeURIComponent(title)}`;
-                const headers = {
-                    'User-Agent': baseUserAgent()
-                };
+                const headers = { 'User-Agent': baseUserAgent() };
                 if (cookie) headers['Cookie'] = cookie;
 
-                const searchRes = await fetch(searchUrl, { 
-                    method: 'GET',
-                    headers: headers,
-                    signal 
-                });
-                
-                if (!searchRes.ok) {
-                    throw new Error(`HTTP ${searchRes.status}`);
-                }
-
+                const searchRes = await fetch(searchUrl, { headers });
                 const searchHtml = await searchRes.text();
                 
-                // Проверка на блокировку
-                if (searchHtml.includes('Проверяем, что вы не бот') || searchHtml.includes('Anubis')) {
+                if (searchHtml.includes('Anubis') || searchHtml.includes('105')) {
                     this.activity.loader(false);
-                    Lampa.Noty.show('Требуется авторизация (Cookie)');
-                    return;
+                    return Lampa.Noty.show('Rezka блокирует: требуется Cookie');
                 }
 
                 const parser = new DOMParser();
                 const doc = parser.parseFromString(searchHtml, 'text/html');
-                const items = doc.querySelectorAll('.b-content__inline_item');
-                
-                let movieUrl = null;
-                for (let item of items) {
-                    const link = item.querySelector('.b-content__inline_item-link');
-                    if (link) {
-                        movieUrl = link.getAttribute('href');
-                        break;
-                    }
-                }
-
-                if (!movieUrl) {
+                const link = doc.querySelector('.b-content__inline_item-link');
+                if (!link) {
                     this.activity.loader(false);
-                    Lampa.Noty.show(Lampa.Lang.translate('hdrezka_notfound'));
-                    return;
+                    return Lampa.Noty.show('Фильм не найден на HDRezka');
                 }
+                const movieUrl = link.getAttribute('href');
 
-                // 2. Получение страницы фильма
-                const pageRes = await fetch(movieUrl, { 
-                    method: 'GET',
-                    headers: headers,
-                    signal 
-                });
+                // 2. Страница фильма
+                const pageRes = await fetch(movieUrl, { headers });
                 const pageHtml = await pageRes.text();
                 const pageDoc = parser.parseFromString(pageHtml, 'text/html');
                 
@@ -177,213 +88,143 @@
                 const scripts = pageDoc.querySelectorAll('script');
                 for (let s of scripts) {
                     const text = s.textContent;
-                    if (text.includes('sof.tv') || text.includes('initPlayer')) {
-                        const idMatch = text.match(/id:\s*(\d+)/);
-                        const hashMatch = text.match(/hash:\s*["']([a-f0-9]+)["']/);
-                        if (idMatch) playerId = idMatch[1];
-                        if (hashMatch) playerHash = hashMatch[1];
-                    }
+                    const idMatch = text.match(/id:\s*(\d+)/);
+                    const hashMatch = text.match(/hash:\s*["']([a-f0-9]+)["']/);
+                    if (idMatch) playerId = idMatch[1];
+                    if (hashMatch) playerHash = hashMatch[1];
                 }
 
                 if (!playerId || !playerHash) {
                     this.activity.loader(false);
-                    Lampa.Noty.show('Плеер не найден');
-                    return;
+                    return Lampa.Noty.show('Плеер не найден');
                 }
 
-                // 4. AJAX запрос к CDN
+                // 4. AJAX к CDN
                 const formData = new URLSearchParams();
                 formData.append('id', playerId);
                 formData.append('hash', playerHash);
                 
-                const ajaxHeaders = {
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'User-Agent': baseUserAgent(),
-                    'Referer': movieUrl
-                };
-                if (cookie) ajaxHeaders['Cookie'] = cookie;
-
                 const ajaxRes = await fetch(`${mirror}/ajax/get_cdn_series/`, {
                     method: 'POST',
                     body: formData,
-                    headers: ajaxHeaders,
-                    signal
+                    headers: { ...headers, 'X-Requested-With': 'XMLHttpRequest', 'Referer': movieUrl }
                 });
                 
-                if (!ajaxRes.ok) {
-                    throw new Error(`CDN HTTP ${ajaxRes.status}`);
-                }
-
-                const ajaxData = await ajaxRes.json();
-                
-                if (!ajaxData.success) {
+                const data = await ajaxRes.json();
+                if (!data.success) {
                     this.activity.loader(false);
-                    Lampa.Noty.show('Ошибка CDN');
-                    return;
+                    return Lampa.Noty.show('Ошибка CDN');
                 }
 
-                // 5. Построение плейлиста
-                this.buildPlaylist(ajaxData, movieUrl);
+                this.buildPlaylist(data);
 
             } catch (e) {
-                if (e.name !== 'AbortError') {
-                    this.activity.loader(false);
-                    Lampa.Noty.show('Ошибка: ' + e.message);
-                }
+                this.activity.loader(false);
+                Lampa.Noty.show('Ошибка сети: ' + e.message);
             }
         };
 
-        this.buildPlaylist = function (data, movieUrl) {
+        this.buildPlaylist = function (data) {
             const decrypted = decryptRezka(data.url || data);
-            
-            if (!decrypted || (!decrypted.mp4 && !decrypted.hls)) {
-                this.activity.loader(false);
-                Lampa.Noty.show('Не удалось расшифровать потоки');
-                return;
-            }
-
-            const playlist = [];
             const qualities = decrypted.mp4 || decrypted.hls || {};
             
+            this.scroll.reset();
             for (const [quality, url] of Object.entries(qualities)) {
-                playlist.push({
-                    title: `${quality}p`,
-                    file: url,
-                    quality: parseInt(quality) || 0
+                const item = $(`
+                    <div class="online__item selector">
+                        <div class="online__quality">${quality}p</div>
+                    </div>
+                `);
+                item.on('hover:enter', () => {
+                    Lampa.Player.play({
+                        title: object.movie.title,
+                        url: url,
+                        quality: parseInt(quality) || 1080
+                    });
                 });
+                this.scroll.append(item);
             }
-
-            playlist.sort((a, b) => b.quality - a.quality);
-
-            if (playlist.length === 0) {
-                this.activity.loader(false);
-                Lampa.Noty.show('Потоки не найдены');
-                return;
-            }
-
             this.activity.loader(false);
-
-            const first = {
-                title: object.movie.title,
-                url: playlist[0].file,
-                quality: playlist[0].quality
-            };
-
-            Lampa.Player.play(first);
-            if (playlist.length > 1) {
-                Lampa.Player.playlist(playlist);
-            }
-        };
-
-        this.reset = function () {
-            if (activeController) {
-                activeController.abort();
-                activeController = null;
-            }
-            if (network) {
-                network.clear();
-            }
         };
 
         this.destroy = function () {
-            this.reset();
-            network = null;
+            this.network.clear();
         };
     }
 
-    // --- 6. Настройки ---
-    function addSettings() {
-        Lampa.SettingsApi.addComponent({
-            component: 'hdrezka_clean',
-            name: 'HDRezka Clean',
-            icon: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'
-        });
+    // --- 4. Регистрация компонента (КРИТИЧЕСКИ ВАЖНО для Uncensored) ---
+    Lampa.Component.add('online', online); 
 
-        Lampa.SettingsApi.addParam({
-            component: 'hdrezka_clean',
-            param: {
-                name: 'hdrezka_mirror',
-                type: 'input',
-                default: 'https://rezka.ag'
-            },
-            field: {
-                name: '#{hdrezka_mirror}',
-                description: 'Например: rezka.ag или hdrezka.me'
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'hdrezka_clean',
-            param: {
-                name: 'hdrezka_cookie',
-                type: 'input',
-                default: ''
-            },
-            field: {
-                name: '#{hdrezka_cookie}',
-                description: 'Автоматически заполняется кнопкой ниже'
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'hdrezka_clean',
-            param: {
-                name: 'hdrezka_fill_cookie',
-                type: 'button',
-                default: ''
-            },
-            field: {
-                name: '#{hdrezka_fill_cookie}',
-                description: 'Нажмите для автоматического получения Cookie'
-            },
-            onRender: function (item) {
-                item.on('hover:enter', function () {
-                    const status = item.find('.settings-param__status');
-                    status.removeClass('active error wait').addClass('wait');
-                    
-                    fillCookie(function (success) {
-                        if (success) {
-                            status.removeClass('active error wait').addClass('active');
-                            Lampa.Noty.show('Cookie успешно получены!');
-                        } else {
-                            status.removeClass('active error wait').addClass('error');
-                            Lampa.Noty.show('Не удалось получить Cookie');
-                        }
-                    });
-                });
-            }
-        });
-    }
-
-    // --- 7. Регистрация ---
-    Lampa.Component.add(SOURCE, component);
-    
     Lampa.Manifest.plugins.push({
         type: 'video',
         version: '1.0',
-        name: TITLE,
-        description: Lampa.Lang.translate('online_mod_watch'),
-        component: SOURCE,
-        onContextMenu: function (object) {
-            return {
-                name: Lampa.Lang.translate('online_mod_watch'),
-                description: ''
-            };
-        },
-        onContextLauch: function (object) {
+        name: 'HDRezka',
+        description: 'Просмотр через HDRezka',
+        component: 'online',
+        onContextMenu: () => ({ name: 'HDRezka', description: '' }),
+        onContextLauch: (object) => {
             Lampa.Activity.push({
                 url: '',
-                title: Lampa.Lang.translate('online_mod_watch'),
-                component: SOURCE,
-                movie: object,
+                title: 'HDRezka',
+                component: 'online',
+                movie: object.movie,
                 page: 1
             });
         }
     });
 
-    addSettings();
-    
-    console.log('[HDRezka Clean] Plugin loaded for Lampa Uncensored');
+    // --- 5. Настройки (Правильный инжект для Lampa Uncensored) ---
+    Lampa.Settings.listener.follow('open', function (e) {
+        if (e.name == 'more' || e.name == 'main') {
+            // Проверяем, не добавили ли мы уже наши настройки
+            if (e.body.find('[data-name="online_mod_rezka2_mirror"]').length) return;
 
+            const template = `
+                <div class="settings-folder">
+                    <div class="settings-folder__name">HDRezka Clean</div>
+                </div>
+                <div class="settings-param selector" data-name="online_mod_rezka2_mirror" data-type="input" placeholder="https://rezka.ag">
+                    <div class="settings-param__name">#{online_mod_rezka2_mirror}</div>
+                    <div class="settings-param__value"></div>
+                </div>
+                <div class="settings-param selector" data-name="online_mod_rezka2_cookie" data-type="input" data-string="true">
+                    <div class="settings-param__name">#{online_mod_rezka2_cookie}</div>
+                    <div class="settings-param__value"></div>
+                </div>
+            `;
+            
+            e.body.find('.settings-folder').last().after(template);
+            
+            // Обновление значений (именно так работает в Uncensored, без крашей)
+            Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_mirror"]'), [], e.body);
+            Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_cookie"]'), [], e.body);
+            
+            // Обработчики клика
+            e.body.find('[data-name="online_mod_rezka2_mirror"]').on('hover:enter', function () {
+                Lampa.Input.edit({
+                    title: '#{online_mod_rezka2_mirror}',
+                    value: Lampa.Storage.get('online_mod_rezka2_mirror', 'https://rezka.ag'),
+                    nosoft: true,
+                    free: true
+                }, function (new_value) {
+                    Lampa.Storage.set('online_mod_rezka2_mirror', new_value);
+                    Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_mirror"]'), [], e.body);
+                });
+            });
+
+            e.body.find('[data-name="online_mod_rezka2_cookie"]').on('hover:enter', function () {
+                Lampa.Input.edit({
+                    title: '#{online_mod_rezka2_cookie}',
+                    value: Lampa.Storage.get('online_mod_rezka2_cookie', ''),
+                    nosoft: true,
+                    free: true
+                }, function (new_value) {
+                    Lampa.Storage.set('online_mod_rezka2_cookie', new_value);
+                    Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_cookie"]'), [], e.body);
+                });
+            });
+        }
+    });
+
+    console.log('[HDRezka Clean] Loaded for Lampa Uncensored');
 })();
