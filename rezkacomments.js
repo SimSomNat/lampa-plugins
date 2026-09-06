@@ -21,6 +21,17 @@
   }
   RezkaProxyError.prototype = Object.create(Error.prototype);
 
+  // fetch() требует, чтобы значения заголовков были в ISO-8859-1 (Latin-1).
+  // Ссылки на Rezka нередко содержат кириллицу прямо в slug
+  // (например, /series/comedy/12345-футурама-1999.html), поэтому Referer
+  // с такой ссылкой валит fetch с "String contains non ISO-8859-1 code point".
+  // Процентно кодируем только не-ASCII символы, оставляя остальную часть
+  // URL читаемой (сервер Rezka корректно принимает такой Referer).
+  function toHeaderSafe(str) {
+    if (!str) return str;
+    return str.replace(/[^\x00-\xFF]/g, (ch) => encodeURIComponent(ch));
+  }
+
   /**
    * Единая точка сетевых запросов к Rezka.
    *
@@ -46,8 +57,8 @@
       let requestUrl = p + '?url=' + encodeURIComponent(target);
 
       let headers = {};
-      if (cookie) headers['x-cookie'] = cookie;
-      headers['x-referer'] = referer || (host + '/');
+      if (cookie) headers['x-cookie'] = toHeaderSafe(cookie);
+      headers['x-referer'] = toHeaderSafe(referer || (host + '/'));
 
       let response = await fetch(requestUrl, { method: 'GET', headers: headers });
 
@@ -81,8 +92,8 @@
 
     // --- Fallback без прокси: сработает только если окружение не блокирует CORS ---
     let headers = {};
-    if (cookie) headers['x-cookie'] = cookie;
-    if (referer) headers['x-referer'] = referer;
+    if (cookie) headers['x-cookie'] = toHeaderSafe(cookie);
+    if (referer) headers['x-referer'] = toHeaderSafe(referer);
 
     let response = await fetch(target, { method: 'GET', headers: headers });
     let fc = await response.text();
