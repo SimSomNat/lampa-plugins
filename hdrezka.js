@@ -55,7 +55,7 @@
     // Get active HDrezka mirror
     function getRezkaMirror() {
         var mirror = Lampa.Storage.get('online_mod_rezka2_mirror', '') + '';
-        if (!mirror) return 'https://rezka.ag';
+        if (!mirror) return 'https://kvk.zone';
         if (mirror.indexOf('://') === -1) mirror = 'https://' + mirror;
         if (mirror.charAt(mirror.length - 1) === '/') mirror = mirror.substring(0, mirror.length - 1);
         return mirror;
@@ -94,8 +94,8 @@
     function getProxy(type) {
         var myIp = getMyIp() || '';
         var ipParam = Lampa.Storage.field('online_mod_proxy_find_ip') === true ? 'ip' + myIp + '/' : '';
-        var workerProxy = (new Date().getHours() % 2) ? 'https://cors.fx666.workers.dev/' : 'https://cors557.deno.dev/';
-        var defaultWorker = 'https://cors.nb557.workers.dev/';
+        var workerProxy = (new Date().getHours() % 2) ? 'https://cors.nb557.workers.dev:8443/' : 'https://cors.fx666.workers.dev:8443/';
+        var defaultWorker = 'https://cors557.deno.dev/';
         var ipWorker = defaultWorker + (ipParam ? '' : 'ip/');
         
         var customProxyActive = Lampa.Storage.field('online_mod_proxy_other') === true;
