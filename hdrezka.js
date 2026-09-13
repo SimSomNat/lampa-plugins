@@ -1921,8 +1921,15 @@
         Lampa.Params.trigger('online_mod_full_episode_title', false);
         Lampa.Params.trigger('online_mod_rezka2_fix_stream', false);
 
-        // ВАЖНО: Удалена ломающая регистрация текстовых полей ('online_mod_rezka2_mirror', 'online_mod_rezka2_name' и др.) через Lampa.Params.select()!
-        // Оставлен только реальный select choice:
+        // Обязательная регистрация текстовых полей (type="input") в реестре Lampa.Params:
+        // В архитектуре Lampa вызов select(name, '', '') инициализирует values[name] = '',
+        // благодаря чему update$3 не падает с "Cannot read properties of undefined (reading 'undefined')"
+        Lampa.Params.select('online_mod_rezka2_mirror', '', '');
+        Lampa.Params.select('online_mod_rezka2_name', '', '');
+        Lampa.Params.select('online_mod_rezka2_password', '', '');
+        Lampa.Params.select('online_mod_rezka2_cookie', '', '');
+        Lampa.Params.select('online_mod_proxy_other_url', '', '');
+
         Lampa.Params.select('online_mod_rezka2_prx_ukr', {
             'prx.ukrtelcdn.net': 'prx.ukrtelcdn.net',
             'prx-cogent.ukrtelcdn.net': 'prx-cogent.ukrtelcdn.net',
@@ -1932,6 +1939,25 @@
             'prx-ams.ukrtelcdn.net': 'prx-ams.ukrtelcdn.net',
             'prx2-ams.ukrtelcdn.net': 'prx2-ams.ukrtelcdn.net'
         }, 'prx.ukrtelcdn.net');
+
+        // Глобальный защитный перехватчик для Lampa.Params.update: предотвращает любые падения при открытии настроек
+        if (Lampa.Params && Lampa.Params.update && !Lampa.Params._rezka_guarded) {
+            Lampa.Params._rezka_guarded = true;
+            var _orig_update = Lampa.Params.update;
+            Lampa.Params.update = function (elem, elems, elems_html) {
+                try {
+                    if (elem && elem.data) {
+                        var name = elem.data('name');
+                        if (name && Lampa.Params.values && typeof Lampa.Params.values[name] === 'undefined') {
+                            Lampa.Params.values[name] = '';
+                        }
+                    }
+                    return _orig_update.apply(this, arguments);
+                } catch (e) {
+                    return _orig_update.apply(this, arguments);
+                }
+            };
+        }
 
         if (window.location.protocol === 'https:') {
             Lampa.Storage.set('online_mod_prefer_http', 'false');
