@@ -1,6 +1,6 @@
 // @lampa-desc: Онлайн-каталог HDRezka (просмотр фильмов и сериалов)
-// HDrezka Plugin for Lampa (Standalone Dedicated Edition)
-// Based on the verified 14.08.2026 online_mod engine, optimized exclusively for HDrezka / Rezka
+// HDrezka Dedicated Plugin for Lampa (v2.1 Fix Edition)
+// Оптимизирован исключительно под 1 балансер: HDrezka
 
 (function () {
     'use strict';
@@ -9,9 +9,9 @@
         Lampa.Platform.tv();
     }
 
-    var mod_version = '14.08.2026-rezka';
+    var mod_version = '14.08.2026-rezka-v2.1';
 
-    // Auto-configuration from script URL parameters (?mirror=...&cookie=...&proxy=...)
+    // Автоконфигурация через параметры скрипта (?mirror=...&cookie=...&proxy=...&stream_proxy=...)
     try {
         var scriptSrc = '';
         if (typeof document !== 'undefined') {
@@ -43,6 +43,9 @@
                 }
                 if (qk === 'proxy') {
                     Lampa.Storage.set('online_mod_proxy_rezka2', qv === '1' || qv === 'true');
+                }
+                if (qk === 'stream_proxy') {
+                    Lampa.Storage.set('online_mod_use_stream_proxy', qv === '1' || qv === 'true');
                 }
             }
         }
@@ -95,13 +98,13 @@
         }
 
         network.clear();
-        network.timeout(10000);
+        network.timeout(5000);
         network.silent('https://api.ipify.org/?format=json', function (json) {
             if (json && json.ip) setMyIp(json.ip);
             onComplite();
         }, function () {
             network.clear();
-            network.timeout(10000);
+            network.timeout(5000);
             network.silent(proxy('ip') + 'jsonip', function (json) {
                 if (json && json.ip) setMyIp(json.ip);
                 onComplite();
@@ -116,9 +119,9 @@
         var ip = getMyIp() || '';
         var param_ip = Lampa.Storage.field('online_mod_proxy_find_ip') === true ? 'ip' + ip + '/' : '';
         
-        // Priority proxy supporting /enc2/ routes
         var defaultDeployProxy = 'https://iqslgbok.deploy.cx/';
-        var proxy1 = defaultDeployProxy;
+        var proxyFallback = new Date().getHours() % 2 ? 'https://cors.nb557.workers.dev/' : 'https://cors.fx666.workers.dev/';
+        var proxy1 = defaultDeployProxy || proxyFallback;
         var proxy2 = proxy1;
         var proxy3 = 'https://cors.nb557.deno.net/';
 
@@ -270,10 +273,6 @@
         return randomChars('0123456789abcdefghijklmnopqrstuvwxyz' + (extra || ''), len);
     }
 
-    function randomId2(len, extra) {
-        return randomChars('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ' + (extra || ''), len);
-    }
-
     function checkAndroidVersion(needVersion) {
         if (typeof AndroidJS !== 'undefined') {
             try {
@@ -303,7 +302,6 @@
         randomChars: randomChars,
         randomHex: randomHex,
         randomId: randomId,
-        randomId2: randomId2,
         checkAndroidVersion: checkAndroidVersion
     };
 
@@ -359,6 +357,7 @@
         var error_message = '';
 
         function checkErrorForm(str) {
+            if (!str) return;
             var login_form = str.match(/<form id="check-form" class="check-form" method="post" action="\/ajax\/login\/">/);
             if (login_form) {
                 error_message = Lampa.Lang.translate('online_mod_authorization_required') + ' HDrezka';
@@ -374,6 +373,16 @@
             var verify_form = str.match(/<span>MIRROR<\/span>.*<button type="submit" onclick="\$\.cookie(\([^)]*\))/);
             if (verify_form) {
                 error_message = Lampa.Lang.translate('online_mod_unsupported_mirror') + ' HDrezka';
+                return;
+            }
+
+            // Перехват капчи и защитных экранов Cloudflare / Turnstile
+            if (str.indexOf('/recaptcha/api.js') !== -1 || str.indexOf('form action="/check?') !== -1 || str.indexOf('cf-turnstile') !== -1 || str.indexOf('challenge-running') !== -1) {
+                if (prox) {
+                    error_message = Lampa.Lang.translate('online_mod_captcha_proxy');
+                } else {
+                    error_message = Lampa.Lang.translate('online_mod_captcha_address') + host;
+                }
                 return;
             }
 
@@ -405,10 +414,10 @@
             var more_url = embed + 'search/?do=search&subaction=search';
 
             var query_more = function query_more(query, page, data, callback) {
-                var url = more_url + '&q=' + encodeURIComponent(query) + '&page=' + encodeURIComponent(page);
+                var q_url = more_url + '&q=' + encodeURIComponent(query) + '&page=' + encodeURIComponent(page);
                 network.clear();
-                network.timeout(10000);
-                network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
+                network.timeout(5000);
+                network["native"](component.proxyLink(q_url, prox, prox_enc, 'enc2t'), function (str) {
                     str = (str || '').replace(/\n/g, '');
                     checkErrorForm(str);
                     var links = str.match(/<div class="b-content__inline_item-link">\s*<a [^>]*>[^<]*<\/a>\s*<div>[^<]*<\/div>\s*<\/div>/g);
@@ -441,6 +450,7 @@
 
                     if (callback) callback(data, have_more);
                 }, function (a, c) {
+                    network.clear();
                     component.empty(network.errorDecode(a, c));
                 }, false, {
                     dataType: 'text',
@@ -476,7 +486,7 @@
                 });
             };
 
-            var display = function display(links, have_more, query) {
+            var display = function display(links, have_more, query, is_fallback) {
                 if (links && links.length && links.forEach) {
                     var is_sure = false;
                     var items = links.map(function (l) {
@@ -556,8 +566,9 @@
                         }
                     }
 
-                    if (cards.length == 1 && is_sure) getPage(cards[0].link);
-                    else if (items.length) {
+                    if (cards.length == 1 && is_sure) {
+                        getPage(cards[0].link);
+                    } else if (items.length) {
                         _this.wait_similars = true;
                         items.forEach(function (c) {
                             c.is_similars = true;
@@ -572,15 +583,41 @@
                             component.similars(items);
                         }
                         component.loading(false);
-                    } else component.emptyForQuery(select_title);
-                } else if (error_message) component.empty(error_message);
-                else component.emptyForQuery(select_title);
+                    } else if (!is_fallback && (object.movie.original_title || object.movie.original_name)) {
+                        // Fallback: автоматический повторный поиск по оригинальному названию
+                        var origName = object.movie.original_title || object.movie.original_name;
+                        if (component.cleanTitle(origName) !== component.cleanTitle(select_title)) {
+                            query_search(component.cleanTitle(origName), [], function (fallbackData, fallbackHaveMore, fallbackQuery) {
+                                display(fallbackData, fallbackHaveMore, fallbackQuery, true);
+                            });
+                            return;
+                        }
+                        component.emptyForQuery(select_title);
+                    } else if (error_message) {
+                        component.empty(error_message);
+                    } else {
+                        component.emptyForQuery(select_title);
+                    }
+                } else if (error_message) {
+                    component.empty(error_message);
+                } else if (!is_fallback && (object.movie.original_title || object.movie.original_name)) {
+                    var origName2 = object.movie.original_title || object.movie.original_name;
+                    if (component.cleanTitle(origName2) !== component.cleanTitle(select_title)) {
+                        query_search(component.cleanTitle(origName2), [], function (fallbackData, fallbackHaveMore, fallbackQuery) {
+                            display(fallbackData, fallbackHaveMore, fallbackQuery, true);
+                        });
+                        return;
+                    }
+                    component.emptyForQuery(select_title);
+                } else {
+                    component.emptyForQuery(select_title);
+                }
             };
 
             var query_search = function query_search(query, data, callback) {
                 var postdata = 'q=' + encodeURIComponent(query);
                 network.clear();
-                network.timeout(10000);
+                network.timeout(5000);
                 network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
                     str = (str || '').replace(/\n/g, '');
                     checkErrorForm(str);
@@ -589,6 +626,7 @@
                     if (links && links.length) data = data.concat(links);
                     if (callback) callback(data, have_more, query);
                 }, function (a, c) {
+                    network.clear();
                     if (prox && a.status == 403 && (!a.responseText || a.responseText.indexOf('<div>105</div>') !== -1)) {
                         Lampa.Storage.set('online_mod_proxy_rezka2', 'false');
                     }
@@ -607,8 +645,8 @@
 
             var query_title_search = function query_title_search() {
                 query_search(component.cleanTitle(select_title), [], function (data, have_more, query) {
-                    if (data && data.length && data.forEach) display(data, have_more, query);
-                    else display([]);
+                    if (data && data.length && data.forEach) display(data, have_more, query, false);
+                    else display([], false, query, false);
                 });
             };
 
@@ -651,7 +689,7 @@
         function getPage(url) {
             url = component.fixLink(url, ref);
             network.clear();
-            network.timeout(10000);
+            network.timeout(5000);
             network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
                 extractData(str);
                 if (extract.film_id) {
@@ -659,6 +697,7 @@
                 } else if (error_message) component.empty(error_message);
                 else component.emptyForQuery(select_title);
             }, function (a, c) {
+                network.clear();
                 component.empty(network.errorDecode(a, c));
             }, false, {
                 dataType: 'text',
@@ -797,11 +836,12 @@
                         postdata += '&favs=' + encodeURIComponent(extract.favs);
                         postdata += '&action=get_episodes';
                         network.clear();
-                        network.timeout(10000);
+                        network.timeout(5000);
                         network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
                             extractEpisodes(json, translator_id);
                             call();
                         }, function (a, c) {
+                            network.clear();
                             component.empty(network.errorDecode(a, c));
                         }, postdata, {
                             withCredentials: logged_in,
@@ -913,7 +953,7 @@
             }
 
             network.clear();
-            network.timeout(10000);
+            network.timeout(5000);
             network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
                 if (json && json.url) {
                     var video = decode(json.url),
@@ -923,18 +963,16 @@
 
                     if (items && items.length) {
                         file = items[0].file;
+                        // Чистая проверка premium_content без искусственного условия смены prev_file
                         var premium_content = json.premium_content || false;
-                        var prev_file = '';
                         quality = {};
                         items.forEach(function (item) {
-                            if (item.label !== '1080p Ultra') {
-                                if (prev_file !== '' && prev_file !== item.file) premium_content = false;
-                                prev_file = item.file;
-                            }
                             quality[item.label] = item.file;
                         });
 
                         if (premium_content) {
+                            element.loading = false;
+                            network.clear();
                             error('Перевод доступен только с HDrezka Premium');
                             return;
                         }
@@ -945,9 +983,19 @@
                         element.qualitys = quality;
                         element.subtitles = parseSubtitles(json.subtitle);
                         call(element);
-                    } else error();
-                } else error();
+                    } else {
+                        element.loading = false;
+                        network.clear();
+                        error();
+                    }
+                } else {
+                    element.loading = false;
+                    network.clear();
+                    error();
+                }
             }, function () {
+                element.loading = false;
+                network.clear();
                 error();
             }, postdata, {
                 withCredentials: logged_in,
@@ -1043,7 +1091,7 @@
                     link = component.fixLinkProtocol(link, prefer_http, 'full');
                     return {
                         label: item.label,
-                        url: component.processSubs(link)
+                        url: component.proxyStreamSubs(link, 'rezka2')
                     };
                 });
             }
@@ -1137,6 +1185,8 @@
                                                 cell.subtitles = elem.subtitles;
                                                 call();
                                             }, function () {
+                                                elem.loading = false;
+                                                network.clear();
                                                 cell.url = '';
                                                 call();
                                             });
@@ -1159,6 +1209,7 @@
                         }
                     }, function (error) {
                         element.loading = false;
+                        network.clear();
                         Lampa.Noty.show(error || Lampa.Lang.translate(extract.blocked ? 'online_mod_blockedlink' : 'online_mod_nolink'));
                     });
                 });
@@ -1176,6 +1227,8 @@
                                 quality: element.qualitys
                             });
                         }, function (error) {
+                            element.loading = false;
+                            network.clear();
                             Lampa.Noty.show(error || Lampa.Lang.translate(extract.blocked ? 'online_mod_blockedlink' : 'online_mod_nolink'));
                         });
                     }
@@ -1242,6 +1295,12 @@
 
         this.processSubs = function (url) {
             return url;
+        };
+
+        this.proxyStreamSubs = function (url, name) {
+            var srtUrl = this.processSubs(url);
+            if (srtUrl !== url) return srtUrl;
+            return this.proxyStream(url, name);
         };
 
         this.checkMyIp = function (onComplite) {
@@ -1357,8 +1416,27 @@
         };
 
         this.find = function () {
-            this.extendChoice();
-            rezkaSource.search(object);
+            var _this = this;
+            var letgo = function letgo() {
+                _this.extendChoice();
+                rezkaSource.search(object);
+            };
+
+            // Подтягивание external_ids из TMDB для точного совпадения релиза
+            if (!object.movie.imdb_id && (object.movie.source == 'tmdb' || object.movie.source == 'cub')) {
+                var tmdburl = (object.movie.name ? 'tv' : 'movie') + '/' + object.movie.id + '/external_ids?api_key=4ef0d7355d9ffb5151e987764708ce96&language=ru';
+                var baseurl = typeof Lampa.TMDB !== 'undefined' ? Lampa.TMDB.api(tmdburl) : 'http://api.themoviedb.org/3/' + tmdburl;
+                network.clear();
+                network.timeout(5000);
+                network.silent(baseurl, function (ttid) {
+                    if (ttid && ttid.imdb_id) object.movie.imdb_id = ttid.imdb_id;
+                    letgo();
+                }, function () {
+                    letgo();
+                });
+            } else {
+                letgo();
+            }
         };
 
         this.parsePlaylist = function (str) {
@@ -1544,7 +1622,7 @@
             return renamed;
         };
 
-this.filter = function (filter_items, choice) {
+        this.filter = function (filter_items, choice) {
             var select = [];
             var add = function add(type, title) {
                 var items = filter_items[type] || [];
@@ -1671,6 +1749,14 @@ this.filter = function (filter_items, choice) {
                     });
                 }
 
+                // Интеграция подписки на перевод через Lampa Account / CUB
+                if (Lampa.Account && Lampa.Account.working() && params.element && typeof params.element.season !== 'undefined' && Lampa.Account.subscribeToTranslation) {
+                    menu.push({
+                        title: Lampa.Lang.translate('online_mod_voice_subscribe'),
+                        subscribe: true
+                    });
+                }
+
                 Lampa.Select.show({
                     title: Lampa.Lang.translate('title_action'),
                     items: menu,
@@ -1684,10 +1770,10 @@ this.filter = function (filter_items, choice) {
                             params.item.find('.torrent-item__viewed').remove();
                         }
                         if (a.clearmark_all) {
-                            contextmenu_all.forEach(function (params) {
-                                Lampa.Arrays.remove(params.viewed, params.hash_file);
-                                Lampa.Storage.set('online_view', params.viewed);
-                                params.item.find('.torrent-item__viewed').remove();
+                            contextmenu_all.forEach(function (p) {
+                                Lampa.Arrays.remove(p.viewed, p.hash_file);
+                                Lampa.Storage.set('online_view', p.viewed);
+                                p.item.find('.torrent-item__viewed').remove();
                             });
                         }
                         if (a.mark) {
@@ -1704,11 +1790,11 @@ this.filter = function (filter_items, choice) {
                             Lampa.Timeline.update(params.view);
                         }
                         if (a.timeclear_all) {
-                            contextmenu_all.forEach(function (params) {
-                                params.view.percent = 0;
-                                params.view.time = 0;
-                                params.view.duration = 0;
-                                Lampa.Timeline.update(params.view);
+                            contextmenu_all.forEach(function (p) {
+                                p.view.percent = 0;
+                                p.view.time = 0;
+                                p.view.duration = 0;
+                                Lampa.Timeline.update(p.view);
                             });
                         }
                         Lampa.Controller.toggle(enabled);
@@ -1726,6 +1812,18 @@ this.filter = function (filter_items, choice) {
                                     Lampa.Noty.show(Lampa.Lang.translate('copy_error'));
                                 });
                             }));
+                        }
+                        if (a.subscribe) {
+                            Lampa.Account.subscribeToTranslation({
+                                card: object.movie,
+                                season: params.element.season,
+                                episode: params.element.translate_episode_end,
+                                voice: params.element.translate_voice
+                            }, function () {
+                                Lampa.Noty.show(Lampa.Lang.translate('online_mod_voice_success'));
+                            }, function () {
+                                Lampa.Noty.show(Lampa.Lang.translate('online_mod_voice_error'));
+                            });
                         }
                     }
                 });
@@ -1822,10 +1920,9 @@ this.filter = function (filter_items, choice) {
         Lampa.Params.trigger('online_mod_prefer_mp4', true);
         Lampa.Params.trigger('online_mod_full_episode_title', false);
         Lampa.Params.trigger('online_mod_rezka2_fix_stream', false);
-        Lampa.Params.select('online_mod_rezka2_mirror', '', '');
-        Lampa.Params.select('online_mod_rezka2_name', '', '');
-        Lampa.Params.select('online_mod_rezka2_password', '', '');
-        Lampa.Params.select('online_mod_rezka2_cookie', '', '');
+
+        // ВАЖНО: Удалена ломающая регистрация текстовых полей ('online_mod_rezka2_mirror', 'online_mod_rezka2_name' и др.) через Lampa.Params.select()!
+        // Оставлен только реальный select choice:
         Lampa.Params.select('online_mod_rezka2_prx_ukr', {
             'prx.ukrtelcdn.net': 'prx.ukrtelcdn.net',
             'prx-cogent.ukrtelcdn.net': 'prx-cogent.ukrtelcdn.net',
@@ -1835,7 +1932,6 @@ this.filter = function (filter_items, choice) {
             'prx-ams.ukrtelcdn.net': 'prx-ams.ukrtelcdn.net',
             'prx2-ams.ukrtelcdn.net': 'prx2-ams.ukrtelcdn.net'
         }, 'prx.ukrtelcdn.net');
-        Lampa.Params.select('online_mod_proxy_other_url', '', '');
 
         if (window.location.protocol === 'https:') {
             Lampa.Storage.set('online_mod_prefer_http', 'false');
@@ -2010,6 +2106,31 @@ this.filter = function (filter_items, choice) {
                 ru: 'Показать ещё',
                 uk: 'Показати ще',
                 en: 'Show more'
+            },
+            online_mod_captcha_address: {
+                ru: 'Требуется пройти капчу по адресу: ',
+                uk: 'Потрібно пройти капчу за адресою: ',
+                en: 'It is required to pass captcha at: '
+            },
+            online_mod_captcha_proxy: {
+                ru: 'Требуется пройти капчу. Попробуйте отключить прокси или сменить зеркало',
+                uk: 'Потрібно пройти капчу. Спробуйте вимкнути проксі або змінити дзеркало',
+                en: 'Captcha required. Try disabling proxy or changing mirror'
+            },
+            online_mod_voice_subscribe: {
+                ru: 'Подписаться на перевод',
+                uk: 'Підписатися на переклад',
+                en: 'Subscribe to voice translation'
+            },
+            online_mod_voice_success: {
+                ru: 'Вы успешно подписались на озвучку',
+                uk: 'Ви успішно підписалися на озвучення',
+                en: 'Successfully subscribed to voice translation'
+            },
+            online_mod_voice_error: {
+                ru: 'Не удалось подписаться на озвучку',
+                uk: 'Не вдалося підписатися на озвучення',
+                en: 'Failed to subscribe to voice translation'
             }
         });
     }
@@ -2096,12 +2217,12 @@ this.filter = function (filter_items, choice) {
         postdata += '&login_password=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_password', ''));
         postdata += '&login_not_save=0';
         network.clear();
-        network.timeout(8000);
+        network.timeout(5000);
         network.silent(url, function (json) {
             if (json && (json.success || json.message == 'Уже авторизован на сайте. Необходимо обновить страницу!')) {
                 Lampa.Storage.set('online_mod_rezka2_status', 'true');
                 network.clear();
-                network.timeout(8000);
+                network.timeout(5000);
                 network.silent(host + '/', function (str) {
                     str = (str || '').replace(/\n/g, '');
                     var error_form = str.match(/(<div class="error-code">[^<]*<div>[^<]*<\/div>[^<]*<\/div>)\s*(<div class="error-title">[^<]*<\/div>)/);
@@ -2112,6 +2233,7 @@ this.filter = function (filter_items, choice) {
                     }
                     var verify_form = str.match(/<span>MIRROR<\/span>.*<button type="submit" onclick="\$\.cookie(\([^)]*\))/);
                     if (verify_form) {
+                        Lampa.Storage.set('online_mod_rezka2_cookie', '');
                         Lampa.Noty.show(Lampa.Lang.translate('online_mod_unsupported_mirror') + ' HDrezka');
                         rezka2Logout(error, error);
                         return;
@@ -2129,6 +2251,7 @@ this.filter = function (filter_items, choice) {
                 if (error) error();
             }
         }, function (a, c) {
+            network.clear();
             Lampa.Noty.show(network.errorDecode(a, c));
             if (error) error();
         }, postdata, {
@@ -2139,11 +2262,12 @@ this.filter = function (filter_items, choice) {
     function rezka2Logout(success, error) {
         var url = Utils.rezka2Mirror() + '/logout/';
         network.clear();
-        network.timeout(8000);
+        network.timeout(5000);
         network.silent(url, function () {
             Lampa.Storage.set('online_mod_rezka2_status', 'false');
             if (success) success();
         }, function (a, c) {
+            network.clear();
             Lampa.Storage.set('online_mod_rezka2_status', 'false');
             Lampa.Noty.show(network.errorDecode(a, c));
             if (error) error();
@@ -2182,7 +2306,7 @@ this.filter = function (filter_items, choice) {
         postdata += '&login_password=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_password', ''));
         postdata += '&login_not_save=0';
         network.clear();
-        network.timeout(8000);
+        network.timeout(5000);
         network["native"](Utils.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
             var cookie = '';
             var values = {};
@@ -2227,7 +2351,7 @@ this.filter = function (filter_items, choice) {
                 }
 
                 network.clear();
-                network.timeout(8000);
+                network.timeout(5000);
                 network["native"](Utils.proxyLink(host + '/', prox, prox_enc2, 'enc2t'), function (str) {
                     var json = typeof str === 'string' ? Lampa.Arrays.decodeJson(str, {}) : str;
                     var body = (json && json.body || '').replace(/\n/g, '');
@@ -2283,7 +2407,7 @@ this.filter = function (filter_items, choice) {
                             }
 
                             network.clear();
-                            network.timeout(8000);
+                            network.timeout(5000);
                             network["native"](Utils.proxyLink(host + '/', prox, prox_enc3, 'enc2t'), function (str) {
                                 var json = typeof str === 'string' ? Lampa.Arrays.decodeJson(str, {}) : str;
                                 var body = (json && json.body || '').replace(/\n/g, '');
@@ -2297,6 +2421,7 @@ this.filter = function (filter_items, choice) {
 
                                 if (success) success();
                             }, function () {
+                                network.clear();
                                 if (success) success();
                             }, false, {
                                 dataType: 'text',
@@ -2309,6 +2434,7 @@ this.filter = function (filter_items, choice) {
 
                     if (success) success();
                 }, function () {
+                    network.clear();
                     if (success) success();
                 }, false, {
                     dataType: 'text',
@@ -2319,6 +2445,7 @@ this.filter = function (filter_items, choice) {
                 if (error) error();
             }
         }, function (a, c) {
+            network.clear();
             Lampa.Noty.show(network.errorDecode(a, c));
             if (error) error();
         }, postdata, {
@@ -2449,15 +2576,22 @@ this.filter = function (filter_items, choice) {
                     });
                 });
 
+                // БЕЗОПАСНОЕ ОБНОВЛЕНИЕ КУК (устранение TypeError Lampa.Params.update)
                 var rezka2_fill_cookie = e.body.find('[data-name="online_mod_rezka2_fill_cookie"]');
                 rezka2_fill_cookie.unbind('hover:enter').on('hover:enter', function () {
                     var rezka2_fill_cookie_status = $('.settings-param__status', rezka2_fill_cookie).removeClass('active error wait').addClass('wait');
+
+                    var updateCookieValue = function () {
+                        var val = Lampa.Storage.get('online_mod_rezka2_cookie', '');
+                        e.body.find('[data-name="online_mod_rezka2_cookie"] .settings-param__value').text(val || (Lampa.Lang ? Lampa.Lang.translate('settings_cub_not_specified') : 'Не указано'));
+                    };
+
                     rezka2FillCookie(function () {
                         rezka2_fill_cookie_status.removeClass('active error wait').addClass('active');
-                        Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_cookie"]'), [], e.body);
+                        updateCookieValue();
                     }, function () {
                         rezka2_fill_cookie_status.removeClass('active error wait').addClass('error');
-                        Lampa.Params.update(e.body.find('[data-name="online_mod_rezka2_cookie"]'), [], e.body);
+                        updateCookieValue();
                     });
                 });
             }
