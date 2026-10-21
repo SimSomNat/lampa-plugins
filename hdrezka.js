@@ -5,11 +5,133 @@
 (function () {
     'use strict';
 
+    var mod_version = '21.10.2026-rezka-v2.2';
+    var previous = window.hdrezkaRuntime;
+    if (previous && previous.version === mod_version) return;
+    if (previous && previous.dispose) previous.dispose();
+    var runtime = window.hdrezkaRuntime = {version: mod_version, scopes: [], listeners: [], requestId: 0, ownerId: 0};
+    runtime.dispose = function () {
+        runtime.scopes.slice().forEach(function (scope) { scope.destroy(); });
+        runtime.listeners.forEach(function (entry) { entry.listener.remove(entry.type, entry.callback); });
+    };
+    function follow(listener, type, callback) {
+        listener.follow(type, callback);
+        var entry = {listener: listener, type: type, callback: callback};
+        runtime.listeners.push(entry);
+        return function () {
+            listener.remove(type, callback);
+            var index = runtime.listeners.indexOf(entry);
+            if (index !== -1) runtime.listeners.splice(index, 1);
+        };
+    }
+
     if (typeof Lampa !== 'undefined' && Lampa.Platform && Lampa.Platform.tv) {
         Lampa.Platform.tv();
     }
 
-    var mod_version = '14.08.2026-rezka-v2.1';
+    function requestTimeout() {
+        var value = Number(Lampa.Storage.get('online_mod_request_timeout', 12000));
+        return isFinite(value) && value >= 10000 && value <= 30000 ? value : 12000;
+    }
+
+    function diagnose(operation, state) {
+        if (Lampa.Storage.field('online_mod_debug') !== true) return;
+        // Only allowlisted metadata: never log URLs, response bodies, headers or exceptions.
+        var pending = runtime.scopes.reduce(function (count, scope) { return count + scope.pending.length; }, 0);
+        console.log('HDRezka', JSON.stringify({requestId: operation.id, owner: operation.owner,
+            stage: operation.stage, generation: operation.generation, state: state,
+            elapsedMs: Date.now() - operation.started, pending: pending}));
+    }
+
+    function requestError(state, response) {
+        if (state === 'timeout') return 'HDRezka: время ожидания истекло. Нажмите ещё раз для повтора.';
+        var status = response && Number(response.status);
+        return 'HDRezka: ' + (status >= 400 && status <= 599 ? 'HTTP ' + status : 'не удалось обработать ответ') + '. Повторите запрос.';
+    }
+
+    // Each operation owns a Reguest. clear() only forgets JS callbacks; it does NOT abort native HTTP.
+    function RequestScope() {
+        var scope = this;
+        this.owner = ++runtime.ownerId;
+        this.generation = 0;
+        this.disposed = false;
+        this.pending = [];
+        runtime.scopes.push(this);
+        this.run = function (stage, send, parse, complete) {
+            var network = new Lampa.Reguest();
+            var op = {id: ++runtime.requestId, owner: scope.owner, stage: stage,
+                generation: scope.generation, state: 'pending', started: Date.now()};
+            var timer;
+            function settleOnce(state, value) {
+                if (op.state !== 'pending') return;
+                op.state = state;
+                clearTimeout(timer);
+                network.clear();
+                var index = scope.pending.indexOf(op);
+                if (index !== -1) scope.pending.splice(index, 1);
+                diagnose(op, state);
+                try { complete(state, value, op); }
+                catch (e) { diagnose(op, 'callback_error'); }
+            }
+            op.cancel = function () { settleOnce('cancelled'); };
+            function resolve(value) {
+                if (op.state !== 'pending') return;
+                if (scope.disposed || op.generation !== scope.generation) return op.cancel();
+                try { value = parse(value); }
+                catch (e) { return settleOnce('error', requestError('error')); }
+                settleOnce('success', value);
+            }
+            function reject(response, reason) {
+                settleOnce(reason === 'timeout' ? 'timeout' : 'error', {message: requestError(reason, response), response: response || {}});
+            }
+            scope.pending.push(op);
+            if (scope.disposed) { op.cancel(); return op; }
+            timer = setTimeout(function () { settleOnce('timeout', requestError('timeout')); }, requestTimeout());
+            diagnose(op, 'pending');
+            try {
+                network.timeout(5000);
+                send(network, resolve, reject);
+            } catch (e) { reject(); }
+            return op;
+        };
+        this.request = function (stage, method, url, success, error, data, options) {
+            return scope.run(stage, function (network, resolve, reject) {
+                network[method](url, resolve, reject, data, options);
+            }, function (value) { return value; }, function (state, value) {
+                if (state === 'cancelled') return;
+                if (state === 'success') {
+                    try { success(value); }
+                    catch (e) { error({}, requestError('error')); }
+                } else error(value && value.response || {}, value && value.message || value);
+            });
+        };
+        this.invalidate = function () {
+            scope.generation++;
+            scope.pending.slice().forEach(function (op) { op.cancel(); });
+        };
+        this.destroy = function () {
+            if (scope.disposed) return;
+            scope.disposed = true;
+            scope.invalidate();
+            var index = runtime.scopes.indexOf(scope);
+            if (index !== -1) runtime.scopes.splice(index, 1);
+        };
+    }
+
+    function finishPlaylist(cell, call, failed) {
+        // LAMPA's no-argument callback destroys the old player and calls play(cell).
+        // Release that wait even on failure, but veto launching an empty/stale item.
+        var listener = Lampa.Player.listener;
+        var abort = function (event) { if (event.data === cell) event.abort(); };
+        if (failed) {
+            cell.url = '';
+            cell.quality = false;
+            cell.subtitles = false;
+            listener.follow('create', abort);
+        }
+        try { call(); }
+        finally { if (failed) listener.remove('create', abort); }
+    }
 
     // Автоконфигурация через параметры скрипта (?mirror=...&cookie=...&proxy=...&stream_proxy=...)
     try {
@@ -90,27 +212,14 @@
         return myIp;
     }
 
-    function checkMyIp$1(network, onComplite) {
-        var ip = getMyIp();
-        if (ip) {
-            onComplite();
-            return;
-        }
-
-        network.clear();
-        network.timeout(5000);
-        network.silent('https://api.ipify.org/?format=json', function (json) {
+    function checkMyIp$1(requests, onComplite) {
+        if (getMyIp()) return onComplite();
+        function received(json) {
             if (json && json.ip) setMyIp(json.ip);
             onComplite();
-        }, function () {
-            network.clear();
-            network.timeout(5000);
-            network.silent(proxy('ip') + 'jsonip', function (json) {
-                if (json && json.ip) setMyIp(json.ip);
-                onComplite();
-            }, function () {
-                onComplite();
-            });
+        }
+        requests.request('ip', 'silent', 'https://api.ipify.org/?format=json', received, function () {
+            requests.request('ip', 'silent', proxy('ip') + 'jsonip', received, onComplite);
         });
     }
 
@@ -309,7 +418,27 @@
     // HDREZKA SOURCE MODULE (rezka2)
     // ==========================================
     function rezka2(component, _object) {
-        var network = new Lampa.Reguest();
+        var requests = new RequestScope();
+        var streams = new RequestScope();
+        var playlistRequests = new RequestScope();
+        var disposed = false;
+        var playGeneration = 0;
+        var activeLaunch;
+        var removePlayerListener = follow(Lampa.Player.listener, 'destroy', function () {
+            playlistRequests.invalidate();
+        });
+        function invalidate() {
+            playGeneration++;
+            requests.invalidate();
+            streams.invalidate();
+            playlistRequests.invalidate();
+        }
+        this.invalidate = invalidate;
+        this.suspend = function () {
+            var pending = requests.pending.length > 0;
+            invalidate();
+            return pending;
+        };
         var extract = {};
         var object = _object;
         var select_title = '';
@@ -394,6 +523,8 @@
 
         this.search = function (_object, kinopoisk_id, data) {
             var _this = this;
+            if (disposed) return;
+            invalidate();
             object = _object;
             select_title = object.search || object.movie.title;
             if (this.wait_similars && data && data[0].is_similars) return getPage(data[0].link);
@@ -415,9 +546,7 @@
 
             var query_more = function query_more(query, page, data, callback) {
                 var q_url = more_url + '&q=' + encodeURIComponent(query) + '&page=' + encodeURIComponent(page);
-                network.clear();
-                network.timeout(5000);
-                network["native"](component.proxyLink(q_url, prox, prox_enc, 'enc2t'), function (str) {
+                requests.request('search', 'native', component.proxyLink(q_url, prox, prox_enc, 'enc2t'), function (str) {
                     str = (str || '').replace(/\n/g, '');
                     checkErrorForm(str);
                     var links = str.match(/<div class="b-content__inline_item-link">\s*<a [^>]*>[^<]*<\/a>\s*<div>[^<]*<\/div>\s*<\/div>/g);
@@ -450,8 +579,7 @@
 
                     if (callback) callback(data, have_more);
                 }, function (a, c) {
-                    network.clear();
-                    component.empty(network.errorDecode(a, c));
+                    component.empty(c || requestError('error', a));
                 }, false, {
                     dataType: 'text',
                     withCredentials: logged_in,
@@ -616,9 +744,7 @@
 
             var query_search = function query_search(query, data, callback) {
                 var postdata = 'q=' + encodeURIComponent(query);
-                network.clear();
-                network.timeout(5000);
-                network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
+                requests.request('search', 'native', component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
                     str = (str || '').replace(/\n/g, '');
                     checkErrorForm(str);
                     var links = str.match(/<li><a href=.*?<\/li>/g);
@@ -626,16 +752,12 @@
                     if (links && links.length) data = data.concat(links);
                     if (callback) callback(data, have_more, query);
                 }, function (a, c) {
-                    network.clear();
-                    if (prox && a.status == 403 && (!a.responseText || a.responseText.indexOf('<div>105</div>') !== -1)) {
-                        Lampa.Storage.set('online_mod_proxy_rezka2', 'false');
-                    }
                     if (a.status == 403 && a.responseText) {
                         var str = (a.responseText || '').replace(/\n/g, '');
                         checkErrorForm(str);
                     }
                     if (error_message) component.empty(error_message);
-                    else component.empty(network.errorDecode(a, c));
+                    else component.empty(c || requestError('error', a));
                 }, postdata, {
                     dataType: 'text',
                     withCredentials: logged_in,
@@ -658,6 +780,8 @@
         };
 
         this.reset = function () {
+            if (disposed) return;
+            invalidate();
             component.reset();
             choice = {
                 season: 0,
@@ -671,6 +795,8 @@
         };
 
         this.filter = function (type, a, b) {
+            if (disposed) return;
+            invalidate();
             choice[a.stype] = b.index;
             if (a.stype == 'voice') choice.voice_name = filter_items.voice[b.index];
             if (a.stype == 'season') choice.season_id = filter_items.season_id[b.index];
@@ -682,23 +808,26 @@
         };
 
         this.destroy = function () {
-            network.clear();
+            if (disposed) return;
+            disposed = true;
+            playGeneration++;
+            removePlayerListener();
+            requests.destroy();
+            streams.destroy();
+            playlistRequests.destroy();
             extract = null;
         };
 
         function getPage(url) {
             url = component.fixLink(url, ref);
-            network.clear();
-            network.timeout(5000);
-            network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
+            requests.request('page', 'native', component.proxyLink(url, prox, prox_enc, 'enc2t'), function (str) {
                 extractData(str);
                 if (extract.film_id) {
                     getEpisodes(success);
                 } else if (error_message) component.empty(error_message);
                 else component.emptyForQuery(select_title);
             }, function (a, c) {
-                network.clear();
-                component.empty(network.errorDecode(a, c));
+                component.empty(c || requestError('error', a));
             }, false, {
                 dataType: 'text',
                 withCredentials: logged_in,
@@ -835,14 +964,11 @@
                         postdata += '&translator_id=' + encodeURIComponent(translator_id);
                         postdata += '&favs=' + encodeURIComponent(extract.favs);
                         postdata += '&action=get_episodes';
-                        network.clear();
-                        network.timeout(5000);
-                        network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
+                        requests.request('episodes', 'native', component.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
                             extractEpisodes(json, translator_id);
                             call();
                         }, function (a, c) {
-                            network.clear();
-                            component.empty(network.errorDecode(a, c));
+                            component.empty(c || requestError('error', a));
                         }, postdata, {
                             withCredentials: logged_in,
                             headers: headers
@@ -932,74 +1058,48 @@
             component.filter(filter_items, choice);
         }
 
-        function getStream(element, call, error) {
-            if (element.stream) return call(element);
-            var url = embed + 'ajax/get_cdn_series/?t=' + Date.now();
-            var postdata = 'id=' + encodeURIComponent(extract.film_id);
+        function getStream(element, call, error, scope) {
+            var cached = {};
+            return (scope || streams).run('stream', function (network, resolve, reject) {
+                if (element.stream) return resolve(cached);
+                var url = embed + 'ajax/get_cdn_series/?t=' + Date.now();
+                var postdata = 'id=' + encodeURIComponent(extract.film_id);
 
-            if (extract.is_series) {
-                postdata += '&translator_id=' + encodeURIComponent(element.media.translator_id);
-                postdata += '&season=' + encodeURIComponent(element.media.season_id);
-                postdata += '&episode=' + encodeURIComponent(element.media.episode_id);
-                postdata += '&favs=' + encodeURIComponent(extract.favs);
-                postdata += '&action=get_stream';
-            } else {
-                postdata += '&translator_id=' + encodeURIComponent(element.media.id);
-                postdata += '&is_camrip=' + encodeURIComponent(element.media.is_camrip);
-                postdata += '&is_ads=' + encodeURIComponent(element.media.is_ads);
-                postdata += '&is_director=' + encodeURIComponent(element.media.is_director);
-                postdata += '&favs=' + encodeURIComponent(extract.favs);
-                postdata += '&action=get_movie';
-            }
-
-            network.clear();
-            network.timeout(5000);
-            network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
-                if (json && json.url) {
-                    var video = decode(json.url),
-                        file = '',
-                        quality = false;
-                    var items = extractItems(video);
-
-                    if (items && items.length) {
-                        file = items[0].file;
-                        // Чистая проверка premium_content без искусственного условия смены prev_file
-                        var premium_content = json.premium_content || false;
-                        quality = {};
-                        items.forEach(function (item) {
-                            quality[item.label] = item.file;
-                        });
-
-                        if (premium_content) {
-                            element.loading = false;
-                            network.clear();
-                            error('Перевод доступен только с HDrezka Premium');
-                            return;
-                        }
-                    }
-
-                    if (file) {
-                        element.stream = file;
-                        element.qualitys = quality;
-                        element.subtitles = parseSubtitles(json.subtitle);
-                        call(element);
-                    } else {
-                        element.loading = false;
-                        network.clear();
-                        error();
-                    }
+                if (extract.is_series) {
+                    postdata += '&translator_id=' + encodeURIComponent(element.media.translator_id);
+                    postdata += '&season=' + encodeURIComponent(element.media.season_id);
+                    postdata += '&episode=' + encodeURIComponent(element.media.episode_id);
+                    postdata += '&favs=' + encodeURIComponent(extract.favs);
+                    postdata += '&action=get_stream';
                 } else {
-                    element.loading = false;
-                    network.clear();
-                    error();
+                    postdata += '&translator_id=' + encodeURIComponent(element.media.id);
+                    postdata += '&is_camrip=' + encodeURIComponent(element.media.is_camrip);
+                    postdata += '&is_ads=' + encodeURIComponent(element.media.is_ads);
+                    postdata += '&is_director=' + encodeURIComponent(element.media.is_director);
+                    postdata += '&favs=' + encodeURIComponent(extract.favs);
+                    postdata += '&action=get_movie';
                 }
-            }, function () {
-                element.loading = false;
-                network.clear();
-                error();
-            }, postdata, {
-                withCredentials: logged_in,
-                headers: headers
+                network["native"](component.proxyLink(url, prox, prox_enc, 'enc2t'), resolve, reject, postdata, {
+                    withCredentials: logged_in,
+                    headers: headers
+                });
+            }, function (json) {
+                if (json === cached) return {stream: element.stream, qualitys: element.qualitys, subtitles: element.subtitles};
+                if (!json || typeof json.url !== 'string') throw new Error('invalid_response');
+                if (json.premium_content) return {premium: true};
+                var items = extractItems(decode(json.url));
+                if (!items.length) throw new Error('invalid_stream');
+                var quality = {};
+                items.forEach(function (item) { quality[item.label] = item.file; });
+                return {stream: items[0].file, qualitys: quality, subtitles: parseSubtitles(json.subtitle)};
+            }, function (state, result, op) {
+                if (state !== 'success') return error(result && result.message || result, state);
+                if (result.premium) return error('Перевод доступен только с HDrezka Premium', 'error');
+                element.stream = result.stream;
+                element.qualitys = result.qualitys;
+                element.subtitles = result.subtitles;
+                try { call(element, op); }
+                catch (e) { error(requestError('error'), 'error'); }
             });
         }
 
@@ -1067,9 +1167,9 @@
                     return {
                         label: item.label,
                         quality: int_quality,
-                        file: component.proxyStream(link, 'rezka2')
+                        file: /^https?:\/\/[^\s/?#]+(?:[/?#][^\s]*)?$/i.test(link) ? component.proxyStream(link, 'rezka2') : ''
                     };
-                });
+                }).filter(function (item) { return /^https?:\/\/[^\s/?#]+(?:[/?#][^\s]*)?$/i.test(item.file); });
                 items.sort(function (a, b) {
                     if (b.quality > a.quality) return 1;
                     if (b.quality < a.quality) return -1;
@@ -1157,11 +1257,15 @@
 
                 if (viewed.indexOf(hash_file) !== -1) item.append('<div class="torrent-item__viewed">' + Lampa.Template.get('icon_star', {}, true) + '</div>');
                 item.on('hover:enter', function () {
-                    if (element.loading) return;
+                    if (disposed || element.loading) return;
+                    var attempt = ++playGeneration;
+                    if (activeLaunch) activeLaunch.cancel();
+                    playlistRequests.invalidate();
                     if (object.movie.id) Lampa.Favorite.add('history', object.movie, 100);
                     element.loading = true;
-                    getStream(element, function (element) {
+                    activeLaunch = getStream(element, function (element, operation) {
                         element.loading = false;
+                        if (disposed || attempt !== playGeneration) return;
                         var first = {
                             url: component.getDefaultQuality(element.qualitys, element.stream),
                             quality: component.renameQualityMap(element.qualitys),
@@ -1169,6 +1273,7 @@
                             timeline: element.timeline,
                             title: element.season ? element.title : select_title + (element.title == select_title ? '' : ' / ' + element.title)
                         };
+                        diagnose({id: operation.id, owner: operation.owner, stage: 'player_launch', generation: attempt, started: operation.started}, 'success');
                         Lampa.Player.play(first);
 
                         if (element.season && Lampa.Platform.version) {
@@ -1179,17 +1284,24 @@
                                 } else {
                                     var cell = {
                                         url: function url(call) {
-                                            getStream(elem, function (elem) {
-                                                cell.url = component.getDefaultQuality(elem.qualitys, elem.stream);
-                                                cell.quality = component.renameQualityMap(elem.qualitys);
-                                                cell.subtitles = elem.subtitles;
-                                                call();
-                                            }, function () {
-                                                elem.loading = false;
-                                                network.clear();
-                                                cell.url = '';
-                                                call();
-                                            });
+                                            var completed = false;
+                                            function finish(failed) {
+                                                if (completed) return;
+                                                completed = true;
+                                                try { finishPlaylist(cell, call, failed); }
+                                                finally { if (failed) cell.url = url; }
+                                            }
+                                            if (disposed || attempt !== playGeneration) return finish(true);
+                                            getStream(elem, function (resolved) {
+                                                if (disposed || attempt !== playGeneration) return finish(true);
+                                                cell.url = component.getDefaultQuality(resolved.qualitys, resolved.stream);
+                                                cell.quality = component.renameQualityMap(resolved.qualitys);
+                                                cell.subtitles = resolved.subtitles;
+                                                finish(false);
+                                            }, function (message, state) {
+                                                if (!disposed && state !== 'cancelled') Lampa.Noty.show(message || requestError('error'));
+                                                finish(true);
+                                            }, playlistRequests);
                                         },
                                         timeline: elem.timeline,
                                         title: elem.title
@@ -1207,9 +1319,10 @@
                             item.append('<div class="torrent-item__viewed">' + Lampa.Template.get('icon_star', {}, true) + '</div>');
                             Lampa.Storage.set('online_view', viewed);
                         }
-                    }, function (error) {
+                    }, function (error, state) {
                         element.loading = false;
-                        network.clear();
+                        if (disposed || state === 'cancelled' || attempt !== playGeneration) return;
+
                         Lampa.Noty.show(error || Lampa.Lang.translate(extract.blocked ? 'online_mod_blockedlink' : 'online_mod_nolink'));
                     });
                 });
@@ -1226,9 +1339,9 @@
                                 file: element.stream,
                                 quality: element.qualitys
                             });
-                        }, function (error) {
-                            element.loading = false;
-                            network.clear();
+                        }, function (error, state) {
+                            if (disposed || state === 'cancelled') return;
+
                             Lampa.Noty.show(error || Lampa.Lang.translate(extract.blocked ? 'online_mod_blockedlink' : 'online_mod_nolink'));
                         });
                     }
@@ -1242,7 +1355,9 @@
     // COMPONENT INTERFACE (Single Balancer: Rezka)
     // ==========================================
     function component(object) {
-        var network = new Lampa.Reguest();
+        var requests = new RequestScope();
+        var disposed = false;
+        var resumeSearch = false;
         var scroll = new Lampa.Scroll({
             mask: true,
             over: true
@@ -1304,7 +1419,7 @@
         };
 
         this.checkMyIp = function (onComplite) {
-            Utils.checkMyIp(network, onComplite);
+            Utils.checkMyIp(requests, onComplite);
         };
 
         var last;
@@ -1375,6 +1490,8 @@
         };
 
         this.search = function () {
+            if (disposed) return;
+            requests.invalidate();
             this.activity.loader(true);
             this.filter({}, {});
             this.reset();
@@ -1418,6 +1535,7 @@
         this.find = function () {
             var _this = this;
             var letgo = function letgo() {
+                if (disposed) return;
                 _this.extendChoice();
                 rezkaSource.search(object);
             };
@@ -1426,9 +1544,7 @@
             if (!object.movie.imdb_id && (object.movie.source == 'tmdb' || object.movie.source == 'cub')) {
                 var tmdburl = (object.movie.name ? 'tv' : 'movie') + '/' + object.movie.id + '/external_ids?api_key=4ef0d7355d9ffb5151e987764708ce96&language=ru';
                 var baseurl = typeof Lampa.TMDB !== 'undefined' ? Lampa.TMDB.api(tmdburl) : 'http://api.themoviedb.org/3/' + tmdburl;
-                network.clear();
-                network.timeout(5000);
-                network.silent(baseurl, function (ttid) {
+                requests.request('metadata', 'silent', baseurl, function (ttid) {
                     if (ttid && ttid.imdb_id) object.movie.imdb_id = ttid.imdb_id;
                     letgo();
                 }, function () {
@@ -1565,6 +1681,7 @@
         };
 
         this.loading = function (status) {
+            if (disposed) return;
             if (status) this.activity.loader(true);
             else {
                 this.activity.loader(false);
@@ -1656,6 +1773,7 @@
         };
 
         this.closeFilter = function () {
+            if (disposed) return;
             if ($('body').hasClass('selectbox--open')) Lampa.Select.close();
         };
 
@@ -1852,7 +1970,12 @@
         };
 
         this.start = function (first_select) {
+            if (disposed) return;
             if (Lampa.Activity.active().activity !== this.activity) return;
+            if (resumeSearch) {
+                resumeSearch = false;
+                return this.search();
+            }
             if (first_select) {
                 var last_views = scroll.render().find('.selector.online').find('.torrent-item__viewed').parent().last();
                 if (object.movie.number_of_seasons && last_views.length) last = last_views.eq(0)[0];
@@ -1890,27 +2013,39 @@
         };
 
         this.back = function () {
+            requests.invalidate();
+            rezkaSource.invalidate();
             Lampa.Activity.backward();
         };
 
-        this.pause = function () {};
-        this.stop = function () {};
+        this.pause = function () {
+            if (disposed) return;
+            resumeSearch = requests.pending.length > 0 || resumeSearch;
+            requests.invalidate();
+            resumeSearch = rezkaSource.suspend() || resumeSearch;
+        };
+        this.stop = this.pause;
 
         this.destroy = function () {
-            network.clear();
+            if (disposed) return;
+            disposed = true;
+            requests.destroy();
+            rezkaSource.destroy();
             files.destroy();
             scroll.destroy();
-            network = null;
-            rezkaSource.destroy();
         };
     }
 
     var androidHeaders = Lampa.Platform && Lampa.Platform.is('android') && Utils.checkAndroidVersion(339);
-    var network = new Lampa.Reguest();
     var online_loading = false;
+    var opening = new RequestScope();
+    var openingIp = new RequestScope();
+    var openingMovie;
 
     function initStorage() {
         Lampa.Storage.set('online_mod_balanser', 'rezka2');
+        Lampa.Params.trigger('online_mod_debug', false);
+        Lampa.Params.select('online_mod_request_timeout', {'10000': '10 s', '12000': '12 s', '15000': '15 s', '30000': '30 s'}, '12000');
         Lampa.Params.trigger('online_mod_use_stream_proxy', false);
         Lampa.Params.trigger('online_mod_proxy_find_ip', false);
         Lampa.Params.trigger('online_mod_proxy_other', false);
@@ -1939,25 +2074,6 @@
             'prx-ams.ukrtelcdn.net': 'prx-ams.ukrtelcdn.net',
             'prx2-ams.ukrtelcdn.net': 'prx2-ams.ukrtelcdn.net'
         }, 'prx.ukrtelcdn.net');
-
-        // Глобальный защитный перехватчик для Lampa.Params.update: предотвращает любые падения при открытии настроек
-        if (Lampa.Params && Lampa.Params.update && !Lampa.Params._rezka_guarded) {
-            Lampa.Params._rezka_guarded = true;
-            var _orig_update = Lampa.Params.update;
-            Lampa.Params.update = function (elem, elems, elems_html) {
-                try {
-                    if (elem && elem.data) {
-                        var name = elem.data('name');
-                        if (name && Lampa.Params.values && typeof Lampa.Params.values[name] === 'undefined') {
-                            Lampa.Params.values[name] = '';
-                        }
-                    }
-                    return _orig_update.apply(this, arguments);
-                } catch (e) {
-                    return _orig_update.apply(this, arguments);
-                }
-            };
-        }
 
         if (window.location.protocol === 'https:') {
             Lampa.Storage.set('online_mod_prefer_http', 'false');
@@ -2167,21 +2283,27 @@
     }
 
     function checkMyIp(onComplite) {
-        if (Lampa.Storage.field('online_mod_proxy_find_ip') !== true) {
-            onComplite();
-            return;
-        }
-        Utils.checkMyIp(network, onComplite);
+        if (Lampa.Storage.field('online_mod_proxy_find_ip') !== true) return onComplite();
+        Utils.checkMyIp(openingIp, onComplite);
     }
 
     function loadOnline(object) {
         if (online_loading) return;
+        var active = Lampa.Activity.active();
+        if (active && active.component === 'online_mod' && active.movie === object) return;
         online_loading = true;
+        openingMovie = object;
         Utils.setMyIp('');
-        checkMyIp(function () {
+        opening.run('open', function (network, resolve) {
+            checkMyIp(resolve);
+        }, function () { return true; }, function (state, message) {
             online_loading = false;
+            openingMovie = null;
+            openingIp.invalidate();
+            if (state === 'cancelled') return;
+            if (Lampa.Activity.active() !== active) return;
+            if (state !== 'success') return Lampa.Noty.show(message || requestError('error'));
             resetTemplates();
-            Lampa.Component.add('online_mod', component);
             Lampa.Activity.push({
                 url: '',
                 title: Lampa.Lang.translate('online_mod_title_full'),
@@ -2212,7 +2334,6 @@
                 };
             },
             onContextLauch: function (object) {
-                online_loading = false;
                 loadOnline(object);
             }
         };
@@ -2221,10 +2342,13 @@
 
         var button = "<div class=\"full-start__button selector view--online_mod\">\n     <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"512\" height=\"512\" viewBox=\"0 0 244 260\" style=\"enable-background:new 0 0 512 512\" xml:space=\"preserve\">\n        <g fill=\"currentColor\">\n            <path d=\"M242,88v170H10V88h41l-38,38h37.1l38-38h38.4l-38,38h38.4l38-38h38.3l-38,38H204L242,88L242,88z M228.9,2l8,37.7l0,0 L191.2,10L228.9,2z M160.6,56l-45.8-29.7l38-8.1l45.8,29.7L160.6,56z M84.5,72.1L38.8,42.4l38-8.1l45.8,29.7L84.5,72.1z M10,88 L2,50.2L47.8,80L10,88z\"/>\n        </g></svg>\n        <span>#{online_mod_title}</span>\n        </div>";
 
-        Lampa.Listener.follow('full', function (e) {
+        follow(Lampa.Listener, 'full', function (e) {
             if (e.type == 'complite') {
+                // A different card invalidates its pending open; repeated completion of the same card does not.
+                if (openingMovie && openingMovie !== e.data.movie) opening.invalidate();
+                var body = e.object.activity.render();
+                if (body.find('.view--online_mod').length) return;
                 var btn = $(Lampa.Lang.translate(button));
-                online_loading = false;
                 btn.on('hover:enter', function () {
                     loadOnline(e.data.movie);
                 });
@@ -2236,20 +2360,34 @@
     // ==========================================
     // REZKA AUTH & COOKIE SYNC
     // ==========================================
+    function authScope(success, error) {
+        var requests = new RequestScope();
+        var finished = false;
+        function finish(callback) {
+            return function () {
+                if (finished) return;
+                finished = true;
+                requests.destroy();
+                if (callback) callback();
+            };
+        }
+        return {requests: requests, success: finish(success), error: finish(error)};
+    }
+
     function rezka2Login(success, error) {
+        var auth = authScope(success, error);
+        var network = auth.requests;
+        success = auth.success;
+        error = auth.error;
         var host = Utils.rezka2Mirror();
         var url = host + '/ajax/login/';
         var postdata = 'login_name=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_name', ''));
         postdata += '&login_password=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_password', ''));
         postdata += '&login_not_save=0';
-        network.clear();
-        network.timeout(5000);
-        network.silent(url, function (json) {
+        network.request('auth', 'silent', url, function (json) {
             if (json && (json.success || json.message == 'Уже авторизован на сайте. Необходимо обновить страницу!')) {
                 Lampa.Storage.set('online_mod_rezka2_status', 'true');
-                network.clear();
-                network.timeout(5000);
-                network.silent(host + '/', function (str) {
+                network.request('auth', 'silent', host + '/', function (str) {
                     str = (str || '').replace(/\n/g, '');
                     var error_form = str.match(/(<div class="error-code">[^<]*<div>[^<]*<\/div>[^<]*<\/div>)\s*(<div class="error-title">[^<]*<\/div>)/);
                     if (error_form) {
@@ -2277,8 +2415,7 @@
                 if (error) error();
             }
         }, function (a, c) {
-            network.clear();
-            Lampa.Noty.show(network.errorDecode(a, c));
+            Lampa.Noty.show(c || requestError('error', a));
             if (error) error();
         }, postdata, {
             withCredentials: true
@@ -2286,16 +2423,17 @@
     }
 
     function rezka2Logout(success, error) {
+        var auth = authScope(success, error);
+        var network = auth.requests;
+        success = auth.success;
+        error = auth.error;
         var url = Utils.rezka2Mirror() + '/logout/';
-        network.clear();
-        network.timeout(5000);
-        network.silent(url, function () {
+        network.request('auth', 'silent', url, function () {
             Lampa.Storage.set('online_mod_rezka2_status', 'false');
             if (success) success();
         }, function (a, c) {
-            network.clear();
             Lampa.Storage.set('online_mod_rezka2_status', 'false');
-            Lampa.Noty.show(network.errorDecode(a, c));
+            Lampa.Noty.show(c || requestError('error', a));
             if (error) error();
         }, false, {
             dataType: 'text',
@@ -2304,6 +2442,10 @@
     }
 
     function rezka2FillCookie(success, error) {
+        var auth = authScope(success, error);
+        var network = auth.requests;
+        success = auth.success;
+        error = auth.error;
         var prox = Utils.proxy('rezka2');
         var prox_enc = '';
         var returnHeaders = androidHeaders;
@@ -2331,9 +2473,7 @@
         var postdata = 'login_name=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_name', ''));
         postdata += '&login_password=' + encodeURIComponent(Lampa.Storage.get('online_mod_rezka2_password', ''));
         postdata += '&login_not_save=0';
-        network.clear();
-        network.timeout(5000);
-        network["native"](Utils.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
+        network.request('auth', 'native', Utils.proxyLink(url, prox, prox_enc, 'enc2t'), function (json) {
             var cookie = '';
             var values = {};
             var sid = '';
@@ -2376,9 +2516,7 @@
                     headers['Cookie'] = cookie;
                 }
 
-                network.clear();
-                network.timeout(5000);
-                network["native"](Utils.proxyLink(host + '/', prox, prox_enc2, 'enc2t'), function (str) {
+                network.request('auth', 'native', Utils.proxyLink(host + '/', prox, prox_enc2, 'enc2t'), function (str) {
                     var json = typeof str === 'string' ? Lampa.Arrays.decodeJson(str, {}) : str;
                     var body = (json && json.body || '').replace(/\n/g, '');
                     var error_form = body.match(/(<div class="error-code">[^<]*<div>[^<]*<\/div>[^<]*<\/div>)\s*(<div class="error-title">[^<]*<\/div>)/);
@@ -2432,9 +2570,7 @@
                                 headers['Cookie'] = cookie;
                             }
 
-                            network.clear();
-                            network.timeout(5000);
-                            network["native"](Utils.proxyLink(host + '/', prox, prox_enc3, 'enc2t'), function (str) {
+                            network.request('auth', 'native', Utils.proxyLink(host + '/', prox, prox_enc3, 'enc2t'), function (str) {
                                 var json = typeof str === 'string' ? Lampa.Arrays.decodeJson(str, {}) : str;
                                 var body = (json && json.body || '').replace(/\n/g, '');
                                 var error_form = body.match(/(<div class="error-code">[^<]*<div>[^<]*<\/div>[^<]*<\/div>)\s*(<div class="error-title">[^<]*<\/div>)/);
@@ -2447,7 +2583,6 @@
 
                                 if (success) success();
                             }, function () {
-                                network.clear();
                                 if (success) success();
                             }, false, {
                                 dataType: 'text',
@@ -2460,7 +2595,6 @@
 
                     if (success) success();
                 }, function () {
-                    network.clear();
                     if (success) success();
                 }, false, {
                     dataType: 'text',
@@ -2471,8 +2605,7 @@
                 if (error) error();
             }
         }, function (a, c) {
-            network.clear();
-            Lampa.Noty.show(network.errorDecode(a, c));
+            Lampa.Noty.show(c || requestError('error', a));
             if (error) error();
         }, postdata, {
             headers: headers,
@@ -2571,16 +2704,19 @@
             "        </div>\n" +
             "    </div>";
 
+        template = template.replace('</div>\n    </div>', '</div>\n' +
+            '<div class="settings-param selector" data-name="online_mod_debug" data-type="toggle"><div class="settings-param__name">HDRezka: диагностика запросов</div><div class="settings-param__value"></div></div>' +
+            '<div class="settings-param selector" data-name="online_mod_request_timeout" data-type="select"><div class="settings-param__name">HDRezka: предел ожидания ответа</div><div class="settings-param__value"></div></div></div>');
         Lampa.Template.add('settings_online_mod', template);
 
         if (window.appready) addSettingsOnlineMod();
         else {
-            Lampa.Listener.follow('app', function (e) {
+            follow(Lampa.Listener, 'app', function (e) {
                 if (e.type == 'ready') addSettingsOnlineMod();
             });
         }
 
-        Lampa.Settings.listener.follow('open', function (e) {
+        follow(Lampa.Settings.listener, 'open', function (e) {
             if (e.name == 'online_mod') {
                 var rezka2_login = e.body.find('[data-name="online_mod_rezka2_login"]');
                 rezka2_login.unbind('hover:enter').on('hover:enter', function () {
