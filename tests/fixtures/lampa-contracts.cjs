@@ -1,6 +1,6 @@
 // Verbatim excerpts from yumata/lampa-source @ 71733ed81f4b13ac1ed1b3328cbbaa7e01afdbd2.
 // src/utils/reguest.js: native/clear; src/interaction/player.js: Playlist select listener.
-// Wrapper parameters supply dependencies; the excerpts themselves are unchanged.
+// Wrapper parameters supply dependencies; only trailing whitespace is normalized.
 exports.NativeRequest = function (native, Arrays, listener) {
     var _calls = [];
     this.native = function(url, complite, error, post_data, params){
@@ -84,7 +84,7 @@ exports.installPlaylist = function (Playlist, Video, Info, document, destroyPlay
             wait_for_loading_url = true
 
             e.item.url(call)
-        } 
+        }
     })
 
     return () => wait_for_loading_url;
