@@ -213,7 +213,9 @@
     };
     var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
     if (typeof module !== 'undefined' && module.exports) module.exports = core;
-    if (!root || !root.Lampa || root.smartbalancer_loaded) return;
+    // Lampa's extension checker recognizes source containing the public Lampa. API.
+    // The listener is also required for attaching and cancelling card sessions.
+    if (!root || !root.Lampa || !root.Lampa.Listener || root.smartbalancer_loaded) return;
     root.smartbalancer_loaded = true;
     var bridge = new LampaBridge(root), engine = new Engine(), history = new History(root.localStorage), current = null, currentMedia = null, searching = false, closing = false;
     function read(name, fallback) { try { var v = root.localStorage.getItem(name); if (v === null) return fallback; if (v === 'true') return true; if (v === 'false') return false; return v; } catch (_) { return fallback; } }
