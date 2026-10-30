@@ -120,6 +120,31 @@
         var deadline = new Promise(function (resolve) { timer = setTimeout(function () { ctrl.abort(); resolve('unknown'); }, timeout); });
         return Promise.race([validate(url, ctrl.signal), deadline]).then(function (status) { clearTimeout(timer); parentSignal.removeEventListener('abort', abort); return status; });
     }
+    function hlsMetadata(text) {
+        if (typeof text !== 'string' || !/^\s*#EXTM3U(?:\r?\n|$)/.test(text)) return { qualities: [], languages: [] };
+        var qualities = [], languages = [];
+        text.split(/\r?\n/).forEach(function (line) {
+            var size = /^#EXT-X-STREAM-INF:/.test(line) && line.match(/(?:[:,])RESOLUTION=\d+x(\d+)(?:,|$)/i);
+            if (size) { var height = Number(size[1]); if (height >= 144 && height <= 4320 && qualities.indexOf(height) < 0) qualities.push(height); }
+            if (/^#EXT-X-MEDIA:/.test(line) && /(?:[:,])TYPE=AUDIO(?:,|$)/i.test(line)) {
+                var language = line.match(/(?:[:,])LANGUAGE="([A-Za-z0-9-]{2,16})"/i);
+                if (language && languages.indexOf(language[1].toLowerCase()) < 0) languages.push(language[1].toLowerCase());
+            }
+        });
+        return { qualities: qualities.sort(function (a, b) { return a - b; }).slice(0, 12), languages: languages.slice(0, 12) };
+    }
+    function probeHls(item, parentSignal) {
+        if (item.providerId !== 'reya' || item.format !== 'hls' || item.status !== 'available') return Promise.resolve();
+        var ctrl = new AbortController(), timer;
+        function abort() { ctrl.abort(); }
+        if (parentSignal.aborted) ctrl.abort(); else parentSignal.addEventListener('abort', abort);
+        var deadline = new Promise(function (resolve) { timer = setTimeout(function () { ctrl.abort(); resolve(null); }, 1500); });
+        var request = fetch(item.url, { signal: ctrl.signal, credentials: 'omit', cache: 'no-store' }).then(function (r) { return r.ok ? readCatalog(r, ctrl.signal) : ''; }).then(hlsMetadata, function () { return null; });
+        return Promise.race([request, deadline]).then(function (info) {
+            clearTimeout(timer); parentSignal.removeEventListener('abort', abort);
+            if (info && !parentSignal.aborted) { item.qualities = info.qualities; item.audioLanguages = info.languages; if (!item.resolution && info.qualities.length) item.resolution = info.qualities[info.qualities.length - 1]; }
+        });
+    }
     function readCatalog(response, signal) {
         var limit = 1048576, length = Number(response.headers.get('content-length'));
         if (length > limit) return Promise.reject(new Error('catalog_too_large'));
@@ -277,7 +302,7 @@
             var work = request.then(function (items) {
                 if (id !== self.session) return [];
                 results = results.concat(items);
-                return items.slice(0, 3).reduce(function (chain, item) { return chain.then(function () { if (id !== self.session || ctrl.signal.aborted) return; return validateLimited(item.url, ctrl.signal, Math.min(1500, Math.floor(timeout / 2))).then(function (status) { if (id !== self.session || ctrl.signal.aborted) return; item.status = status; if (onCandidate) onCandidate(item); }); }); }, Promise.resolve()).then(function () { return items; });
+                return items.slice(0, 3).reduce(function (chain, item) { return chain.then(function () { if (id !== self.session || ctrl.signal.aborted) return; return validateLimited(item.url, ctrl.signal, Math.min(1500, Math.floor(timeout / 2))).then(function (status) { if (id !== self.session || ctrl.signal.aborted) return; item.status = status; return probeHls(item, ctrl.signal).then(function () { if (id === self.session && !ctrl.signal.aborted && onCandidate) onCandidate(item); }); }); }); }, Promise.resolve()).then(function () { return items; });
             });
             return Promise.race([work, deadline]).then(function () {}, function (e) {
                 if (id === self.session) {
@@ -303,6 +328,34 @@
         this.api.Select.show({ title: title, items: items, onSelect: function (item) { if (item.action) item.action(); }, onBack: onBack || function () { bridge.back(); } });
     };
     LampaBridge.prototype.closeMenu = function () { this.api.Select.close(); };
+    LampaBridge.prototype.stopProgress = function () {
+        if (this.progressTimer) this.host.clearInterval(this.progressTimer);
+        this.progressTimer = null;
+        if (this.progressNode && this.progressNode.parentNode) this.progressNode.parentNode.removeChild(this.progressNode);
+        this.progressNode = null; this.progressLabel = null;
+    };
+    LampaBridge.prototype.startProgress = function (message, total) {
+        this.stopProgress();
+        var doc = this.host.document, bridge = this;
+        if (!doc || !doc.querySelector || !doc.createElement) return;
+        var head = doc.querySelector('.selectbox__head');
+        if (!head) return;
+        if (!doc.getElementById('smartbalancer-progress-style')) {
+            var style = doc.createElement('style'); style.id = 'smartbalancer-progress-style';
+            style.textContent = '.sb-progress{display:flex;align-items:center;gap:.6em;opacity:.88;font-size:1em;margin:.65em 0 0}.sb-progress__spinner{width:1em;height:1em;flex:none;border:.12em solid currentColor;border-right-color:transparent;border-radius:50%;animation:sb-spin 1s linear infinite}@keyframes sb-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.sb-progress__spinner{animation:none}}';
+            (doc.head || doc.documentElement).appendChild(style);
+        }
+        var node = doc.createElement('div'), spinner = doc.createElement('span'), label = doc.createElement('span');
+        node.className = 'sb-progress'; node.setAttribute('role', 'status'); node.setAttribute('aria-live', 'polite');
+        spinner.className = 'sb-progress__spinner'; spinner.setAttribute('aria-hidden', 'true'); node.appendChild(spinner); node.appendChild(label); head.appendChild(node);
+        this.progressNode = node; this.progressLabel = label; this.progressMessage = message; this.progressTotal = total || 0; this.progressChecked = 0; this.progressFound = 0; this.progressStarted = Date.now();
+        this.updateProgress(0, 0);
+        this.progressTimer = this.host.setInterval(function () { if (!bridge.progressNode || !bridge.progressNode.parentNode) return bridge.stopProgress(); bridge.updateProgress(bridge.progressChecked, bridge.progressFound); }, 1000);
+    };
+    LampaBridge.prototype.updateProgress = function (checked, found) {
+        this.progressChecked = checked; this.progressFound = found;
+        if (this.progressLabel) this.progressLabel.textContent = this.progressMessage + ' · ' + Math.floor((Date.now() - this.progressStarted) / 1000) + ' с' + (this.progressTotal ? ' · проверено ' + checked + ' из ' + this.progressTotal + ' · найдено ' + found : '');
+    };
     LampaBridge.prototype.settings = function () {
         var bridge = this;
         if (!this.api.Settings || !this.api.Settings.create) return this.notify('Откройте настройки SmartBalancer.');
@@ -348,7 +401,7 @@
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_timeout', type: 'select', values: { '4000': '4 с', '8000': '8 с', '15000': '15 с', '30000': '30 с' }, default: '30000' }, field: { name: 'Тайм-аут источника' } });
         api.addParam({ component: 'smartbalancer', param: { type: 'button' }, field: { name: 'Очистить историю попыток SmartBalancer' }, onChange: clearHistory });
     };
-    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, wikimediaSearch: wikimediaSearch, canSearchWikimedia: canSearchWikimedia, reyaSearch: reyaSearch, canSearchReya: canSearchReya, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
+    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, hlsMetadata: hlsMetadata, readCatalog: readCatalog, openFilms: openFilms, wikimediaSearch: wikimediaSearch, canSearchWikimedia: canSearchWikimedia, reyaSearch: reyaSearch, canSearchReya: canSearchReya, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
     if (typeof module !== 'undefined' && module.exports) module.exports = core;
     // Lampa's extension checker recognizes source containing the public Lampa. API.
     // The listener is also required for attaching and cancelling card sessions.
@@ -367,11 +420,24 @@
         catch (_) { notify('Не удалось передать ссылку плееру. Выберите другой источник.'); }
     }
     function escapeText(value) { return String(value).replace(/[&<>"']/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]; }); }
-    function showResults(result, card) {
+    function showResults(result, card, media, manual) {
         var items = result.items.filter(function (i) { return i.status === 'available' || i.status === 'unknown'; });
         var reasons = { unauthorized: 'источник требует авторизацию', not_found: 'источник или видео не найдены', http_error: 'ошибка сервера источника', timeout: 'превышено время ожидания', invalid_catalog: 'некорректный ответ источника', catalog_too_large: 'ответ источника превышает 1 МиБ', streaming_unsupported: 'WebView не поддерживает потоковое чтение', unavailable_or_cors: 'сеть, TLS или CORS не позволяют прочитать источник' };
-        if (!items.length) { notify(result.errors.length ? 'Нет вариантов: ' + (reasons[result.errors[0]] || 'ошибка источника') + '.' : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию.' : 'В доступных источниках нет полного видео для этой карточки.'); back(); return; }
-        menu('Источники SmartBalancer', items.map(function (item) { return { title: (item.providerId === 'wikimedia' ? 'Wikimedia Commons' : item.providerId) + ' · ' + (item.resolution ? item.resolution + 'p' : 'качество неизвестно') + ' · ' + item.format + ' · ' + item.status + (item.license ? ' · ' + escapeText(item.license) : '') + (item.language ? ' · ' + escapeText(item.language) : '') + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация не подтверждена' : ''), action: function () { if (current === card) { back(); play(item); } } }; }));
+        if (!items.length) {
+            var reason = result.errors.length ? (reasons[result.errors[0]] || 'ошибка источника') : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию' : 'Источник не нашёл подходящее видео';
+            var choices = [{ title: 'Попробовать ещё раз', subtitle: escapeText(reason), action: function () { if (current === card) run(media, manual); } }];
+            if (media.type === 'tv') choices.push({ title: 'Выбрать другую серию', action: function () { if (current === card) episode(media, card, function () { if (current === card) run(media, manual); }); } });
+            choices.push({ title: 'Вернуться к карточке', action: back });
+            menu('Видео не найдено', choices); return;
+        }
+        menu('Источники SmartBalancer', items.map(function (item, index) {
+            var name = item.providerId === 'wikimedia' ? 'Wikimedia Commons' : item.providerId === 'reya' ? 'Reya' : item.providerId;
+            var quality = item.qualities && item.qualities.length ? 'До ' + item.qualities[item.qualities.length - 1] + 'p · адаптивное' : item.resolution ? item.resolution + 'p' : 'качество не указано';
+            var language = item.language ? 'звук: ' + escapeText(item.language) : item.audioLanguages && item.audioLanguages.length ? 'звук: ' + item.audioLanguages.map(escapeText).join(', ') : 'язык звука не указан';
+            var status = item.status === 'available' ? 'доступен' : 'доступность не проверена';
+            var detail = quality + ' · ' + language + ' · ' + status + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация серии не подтверждена' : '');
+            return { title: 'Источник ' + (index + 1) + ' · ' + escapeText(name), subtitle: detail, action: function () { if (current === card) { back(); play(item); } } };
+        }));
     }
     function sourceConfig(media) {
         var configured = [read('smartbalancer_catalog1', ''), read('smartbalancer_catalog2', '')];
@@ -397,17 +463,18 @@
         engine.options.timeout = Number(read('smartbalancer_timeout', '30000')); engine.options.quality = read('smartbalancer_quality', '1080');
         engine.options.language = String(read('smartbalancer_language', '')).trim(); engine.options.voiceover = String(read('smartbalancer_voiceover', '')).trim();
         searching = true;
-        menu('Поиск SmartBalancer', [{ title: 'Отменить поиск', action: function () { engine.cancel(); searching = false; back(); } }], function () { if (!closing) { engine.cancel(); searching = false; back(); } });
         var count = config.count + (config.hasOpenFilm ? 1 : 0) + (config.hasWikimedia ? 1 : 0) + (config.hasReya ? 1 : 0);
-        engine.search(media, urls, function (checked, found) { if (current === card) notify('Проверено: ' + checked + '/' + count + ', вариантов: ' + found); }, function (item) {
+        menu('Поиск SmartBalancer', [{ title: 'Отменить поиск', subtitle: 'Нажмите OK или Back, чтобы вернуться', action: function () { bridge.stopProgress(); engine.cancel(); searching = false; back(); } }], function () { if (!closing) { bridge.stopProgress(); engine.cancel(); searching = false; back(); } });
+        bridge.startProgress('Ищем доступное видео', count);
+        engine.search(media, urls, function (checked, found) { if (current === card) bridge.updateProgress(checked, found); }, function (item) {
             if (current !== card || !searching || manual || !read('smartbalancer_auto', true) || item.status !== 'available' || item.format === 'mkv' || !item.autoEligible || (engine.options.language && item.language.toLowerCase() !== engine.options.language.toLowerCase()) || (engine.options.voiceover && item.voiceover.toLowerCase() !== engine.options.voiceover.toLowerCase())) return;
-            engine.cancel(); searching = false; closing = true; bridge.closeMenu(); closing = false; back(); play(item);
+            bridge.stopProgress(); engine.cancel(); searching = false; closing = true; bridge.closeMenu(); closing = false; back(); play(item);
         }).then(function (result) {
             if (!result.active || current !== card) return;
-            searching = false; closing = true; bridge.closeMenu(); closing = false;
+            bridge.stopProgress(); searching = false; closing = true; bridge.closeMenu(); closing = false;
             var available = result.items.filter(function (i) { return i.status === 'available' && i.format !== 'mkv' && i.autoEligible; });
             if (!manual && read('smartbalancer_auto', true) && available.length) { back(); play(available[0]); }
-            else showResults(result, card);
+            else showResults(result, card, media, manual);
         });
     }
     function episode(media, card, cb) {
@@ -417,33 +484,34 @@
             if (!episodes.length) { notify('Список серий для этого сезона недоступен.'); back(); return; }
             var title = confirmed ? 'Выберите серию · сезон ' + season.number : 'Серии по числу в карточке · сезон ' + season.number;
             menu(title, episodes.map(function (episode) {
-                return { title: String(episode.number) + (episode.title ? ' · ' + escapeText(episode.title) : ''), action: function () {
+                return { title: 'Серия ' + episode.number, subtitle: episode.title ? escapeText(episode.title) : (confirmed ? 'Выберите для поиска' : 'Номер по данным карточки'), action: function () {
                     if (current === card) { media.season = season.number; media.episode = episode.number; media.episodeConfirmed = confirmed; cb(); }
                 } };
-            }));
+            }), function () { if (current === card && seasons.length > 1) selectSeason(); else back(); });
         }
         function chooseSeason(season) {
             if (current !== card) return;
             if (season.episodes.length) return selectEpisodes(season, season.episodes, true);
             var active = true, timer;
-            function cancel() { if (!active) return; active = false; clearTimeout(timer); back(); }
+            function cancel() { if (!active) return; active = false; clearTimeout(timer); bridge.stopProgress(); if (seasons.length > 1) selectSeason(); else back(); }
             function done(response) {
                 if (!active || current !== card) return;
-                active = false; clearTimeout(timer); bridge.closeMenu();
+                active = false; clearTimeout(timer); bridge.stopProgress(); bridge.closeMenu();
                 var detail = response && (response[String(season.number)] || response);
                 var episodes = exactEpisodes(detail, season.number), confirmed = episodes.length > 0;
                 if (confirmed) season.episodes = episodes;
                 else if (season.count) for (var n = 1; n <= season.count; n++) episodes.push({ number: n, title: '' });
                 selectEpisodes(season, episodes, confirmed);
             }
-            menu('Загрузка серий сезона ' + season.number, [{ title: 'Отменить', action: cancel }], cancel);
+            menu('Загрузка серий сезона ' + season.number, [{ title: 'Назад', subtitle: 'Остановить загрузку списка', action: cancel }], cancel);
+            bridge.startProgress('Загружаем список серий', 0);
             timer = setTimeout(function () { done(null); }, 5000);
             if (!bridge.getSeason(card.card || {}, season.number, done)) done(null);
         }
         function selectSeason() {
             if (!seasons.length) { notify('Lampa не предоставила список сезонов этого сериала.'); back(); return; }
             if (seasons.length === 1) return chooseSeason(seasons[0]);
-            menu('Выберите сезон', seasons.map(function (season) { return { title: 'Сезон ' + season.number + (season.number === 0 ? ' · специальные выпуски' : '') + (season.count ? ' · серий: ' + season.count : ''), action: function () { chooseSeason(season); } }; }));
+            menu('Выберите сезон', seasons.map(function (season) { return { title: season.number === 0 ? 'Специальные выпуски' : 'Сезон ' + season.number, subtitle: season.count ? 'Серий: ' + season.count : 'Открыть список серий', action: function () { chooseSeason(season); } }; }));
         }
         var key = media.tmdb && /^\d+$/.test(media.tmdb) ? 'tmdb:' + media.tmdb : media.imdb && /^tt\d+$/.test(media.imdb) ? 'imdb:' + media.imdb : '';
         var last = history.load().reverse().find(function (entry) {
@@ -477,7 +545,7 @@
     bridge.follow('full', function (e) {
         if (e.type === 'start') {
             if (bridge.activeCard() && bridge.activeCard() !== e.object) return;
-            engine.cancel(); searching = false; current = e.object; currentMedia = null;
+            bridge.stopProgress(); engine.cancel(); searching = false; current = e.object; currentMedia = null;
         }
         if (e.type === 'options' && current && currentMedia && e.options) {
             var card = current, media = currentMedia;
@@ -491,11 +559,11 @@
     });
     bridge.follow('activity', function (e) {
         if (e.type === 'start' && e.object !== current) {
-            engine.cancel(); searching = false;
+            bridge.stopProgress(); engine.cancel(); searching = false;
             current = e.component === 'full' ? e.object : null;
             currentMedia = current && current.card ? mediaFrom(current.card, current) : null;
         }
-        if (e.type === 'destroy' && e.object === current) { engine.cancel(); searching = false; current = null; currentMedia = null; }
+        if (e.type === 'destroy' && e.object === current) { bridge.stopProgress(); engine.cancel(); searching = false; current = null; currentMedia = null; }
         // Lampa emits 'archive' after reactivating the previous activity, not when leaving it.
     });
 }(typeof window !== 'undefined' ? window : null));
