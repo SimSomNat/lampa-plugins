@@ -1,4 +1,4 @@
-// @lampa-desc: Экспериментальный выбор разрешённых потоков; для большинства фильмов требуется собственный каталог.
+// @lampa-desc: Автоматический поиск открытых видео; доступность зависит от источников.
 /* Lampa SmartBalancer — GPL-2.0. No bundled third-party runtime. */
 (function (root) {
     'use strict';
@@ -18,7 +18,7 @@
         var date = movie.release_date || movie.first_air_date || '';
         var source = movie.source || object.source;
         var tmdb = movie.tmdb_id || (source === 'tmdb' ? movie.id : null);
-        return { type: type, tmdb: tmdb && String(tmdb), imdb: movie.imdb_id && String(movie.imdb_id), title: String(movie.title || movie.name || ''), year: String(date).slice(0, 4), season: null, episode: null, seasons: seasonMetadata(movie, data) };
+        return { type: type, tmdb: tmdb && String(tmdb), imdb: movie.imdb_id && String(movie.imdb_id), title: String(movie.title || movie.name || ''), originalTitle: String(movie.original_title || movie.original_name || movie.title || movie.name || '').slice(0, 160), runtime: Number(movie.runtime) || 0, year: String(date).slice(0, 4), season: null, episode: null, seasons: seasonMetadata(movie, data) };
     }
     function nonnegativeInteger(value) {
         if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value);
@@ -75,10 +75,10 @@
     function normalize(media, item, provider) {
         if (!match(media, item) || !safeUrl(item.url) || item.headers || item.cookies || item.drm || item.expiresAt && (!Number.isFinite(Date.parse(item.expiresAt)) || Date.parse(item.expiresAt) <= Date.now())) return null;
         var path = item.url.split('?')[0].toLowerCase();
-        var format = item.format || (/\.m3u8$/.test(path) ? 'hls' : /\.mpd$/.test(path) ? 'dash' : /\.mp4$/.test(path) ? 'mp4' : /\.mkv$/.test(path) ? 'mkv' : '');
-        if (['hls', 'dash', 'mp4', 'mkv'].indexOf(format) < 0) return null;
+        var format = item.format || (/\.m3u8$/.test(path) ? 'hls' : /\.mpd$/.test(path) ? 'dash' : /\.mp4$/.test(path) ? 'mp4' : /\.mkv$/.test(path) ? 'mkv' : /\.webm$/.test(path) ? 'webm' : '');
+        if (['hls', 'dash', 'mp4', 'mkv', 'webm'].indexOf(format) < 0) return null;
         var key = media.tmdb && /^\d+$/.test(media.tmdb) ? 'tmdb:' + media.tmdb : media.imdb && /^tt\d+$/.test(media.imdb) ? 'imdb:' + media.imdb : '';
-        return { providerId: provider, title: media.title, url: item.url, format: format, resolution: Number(item.resolution) || 0, language: String(item.language || '').slice(0, 40), voiceover: String(item.voiceover || '').slice(0, 80), status: 'unknown', expiresAt: item.expiresAt || '', autoEligible: media.type !== 'tv' || (item.episodeOrder === 'tmdb' && media.episodeConfirmed !== false), mediaKey: key, season: media.season, episode: media.episode };
+        return { providerId: provider, title: media.title, url: item.url, format: format, resolution: Number(item.resolution) || 0, language: String(item.language || '').slice(0, 40), voiceover: String(item.voiceover || '').slice(0, 80), license: String(item.license || '').slice(0, 80), status: 'unknown', expiresAt: item.expiresAt || '', autoEligible: media.type !== 'tv' || (item.episodeOrder === 'tmdb' && media.episodeConfirmed !== false), mediaKey: key, season: media.season, episode: media.episode };
     }
     function rank(items, desired, language, voiceover) {
         var target = Number(desired) || 1080;
@@ -98,7 +98,7 @@
         } catch (_) { return []; }
     };
     History.prototype.add = function (item) {
-        if (!item.mediaKey || !/^(tmdb:\d+|imdb:tt\d+)$/.test(item.mediaKey) || !/^(catalog-[12]|open-films)$/.test(item.providerId)) return;
+        if (!item.mediaKey || !/^(tmdb:\d+|imdb:tt\d+)$/.test(item.mediaKey) || !/^(catalog-[12]|open-films|wikimedia)$/.test(item.providerId)) return;
         var entries = this.load();
         entries.push({ mediaKey: item.mediaKey, provider: item.providerId, season: Number.isInteger(item.season) ? item.season : null, episode: Number.isInteger(item.episode) ? item.episode : null, event: 'attempted', at: Date.now() });
         try { this.storage.setItem(this.key, JSON.stringify({ version: 1, entries: entries.slice(-50) })); } catch (_) {}
@@ -158,6 +158,62 @@
     function openFilms(media) {
         return OPEN_FILMS.map(function (item) { return normalize(media, item, 'open-films'); }).filter(Boolean);
     }
+    function canSearchWikimedia(media) {
+        return media.type === 'movie' && !!(media.tmdb || media.imdb) && !!(media.originalTitle || media.title) && media.runtime > 0;
+    }
+    function mediaWikiJson(base, params, signal) {
+        var query = Object.keys(params).map(function (key) { return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]); }).join('&');
+        return fetch(base + '?' + query, { signal: signal, credentials: 'omit', cache: 'no-store' }).then(function (response) {
+            if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'unauthorized' : 'http_error');
+            return readCatalog(response, signal);
+        }).then(function (body) {
+            try { return JSON.parse(body); } catch (_) { throw new Error('invalid_catalog'); }
+        });
+    }
+    function claimStrings(claims, property) {
+        return (Array.isArray(claims && claims[property]) ? claims[property] : []).map(function (entry) {
+            return entry && entry.mainsnak && entry.mainsnak.datavalue && entry.mainsnak.datavalue.value;
+        }).filter(function (value) { return typeof value === 'string'; });
+    }
+    function wikimediaSearch(media, context, signal) {
+        if (!canSearchWikimedia(media)) return Promise.resolve([]);
+        var wikidata = 'https://www.wikidata.org/w/api.php', commons = 'https://commons.wikimedia.org/w/api.php';
+        var term = String(media.originalTitle || media.title).slice(0, 160);
+        return mediaWikiJson(wikidata, { action: 'wbsearchentities', search: term, language: 'en', format: 'json', origin: '*', limit: 6 }, signal).then(function (result) {
+            var ids = (Array.isArray(result.search) ? result.search : []).map(function (entry) { return entry && entry.id; }).filter(function (id) { return /^Q\d+$/.test(id || ''); }).slice(0, 6);
+            if (!ids.length) return [];
+            return mediaWikiJson(wikidata, { action: 'wbgetentities', ids: ids.join('|'), props: 'claims', format: 'json', origin: '*' }, signal).then(function (entities) {
+                var files = [];
+                ids.forEach(function (id) {
+                    var claims = entities.entities && entities.entities[id] && entities.entities[id].claims;
+                    var tmdb = claimStrings(claims, 'P4947'), imdb = claimStrings(claims, 'P345');
+                    if ((media.tmdb && tmdb.length && tmdb.indexOf(String(media.tmdb)) < 0) || (media.imdb && imdb.length && imdb.indexOf(String(media.imdb)) < 0)) return;
+                    if (!(media.tmdb && tmdb.indexOf(String(media.tmdb)) >= 0) && !(media.imdb && imdb.indexOf(String(media.imdb)) >= 0)) return;
+                    claimStrings(claims, 'P10').forEach(function (file) { if (file.length <= 200 && !/[|\x00-\x1f]/.test(file) && files.indexOf(file) < 0) files.push(file); });
+                });
+                if (!files.length) return [];
+                return mediaWikiJson(commons, { action: 'query', titles: files.slice(0, 4).map(function (file) { return 'File:' + file; }).join('|'), prop: 'videoinfo', viprop: 'url|size|mime|extmetadata|derivatives', format: 'json', origin: '*' }, signal).then(function (response) {
+                    var pages = response && response.query && response.query.pages || {}, items = [];
+                    Object.keys(pages).forEach(function (key) {
+                        var page = pages[key], video = page && Array.isArray(page.videoinfo) && page.videoinfo[0];
+                        var license = video && video.extmetadata && video.extmetadata.LicenseShortName && String(video.extmetadata.LicenseShortName.value || '');
+                        var duration = video && Number(video.duration), expected = media.runtime * 60;
+                        if (!video || !/^(Public domain|CC0|CC BY(?:-SA)?(?:\s|$))/i.test(license || '') || !duration || Math.abs(duration - expected) > Math.max(120, expected * 0.08)) return;
+                        var variants = Array.isArray(video.derivatives) ? video.derivatives.slice() : [];
+                        variants.push({ src: video.url, type: video.mime, height: video.height });
+                        variants.forEach(function (variant) {
+                            var url = variant && variant.src, type = variant && String(variant.type || '');
+                            if (!safeUrl(url) || !/^https:\/\/upload\.wikimedia\.org\//i.test(url) || !/^video\/webm(?:;|$)/i.test(type)) return;
+                            var quality = String(variant.transcodekey || '').match(/^(\d{3,4})p/);
+                            var item = normalize(media, { type: 'movie', ids: { tmdb: media.tmdb, imdb: media.imdb }, year: media.year, url: url, format: 'webm', resolution: quality ? Number(quality[1]) : Number(variant.height) || 0, license: license }, 'wikimedia');
+                            if (item) items.push(item);
+                        });
+                    });
+                    return rank(items, context.quality).slice(0, 4);
+                });
+            });
+        });
+    }
     // Adapter contract: id, enabled(media), search(media, context, signal).
     // These direct-URL adapters return already normalized candidates; they do
     // not extract URLs from websites or resolve protected players.
@@ -177,6 +233,7 @@
             registry.register({ id: id, search: function (media, context, signal) { return searchCatalog(url, id, media, signal); } });
         });
         if (includeOpenFilms) registry.register({ id: 'open-films', enabled: function (media) { return openFilms(media).length > 0; }, search: function (media) { return Promise.resolve(openFilms(media)); } });
+        registry.register({ id: 'wikimedia', enabled: canSearchWikimedia, search: wikimediaSearch });
         return registry;
     }
     function Engine(options) { this.options = options || {}; this.session = 0; this.controllers = []; this.timers = []; this.pending = []; }
@@ -189,7 +246,7 @@
             var ctrl = new AbortController(); self.controllers.push(ctrl);
             var timer, stop;
             var deadline = new Promise(function (_, reject) { stop = function () { reject(new Error('cancelled')); }; self.pending.push(stop); timer = setTimeout(function () { ctrl.abort(); reject(new Error('timeout')); }, timeout); self.timers.push(timer); });
-            var request = Promise.resolve().then(function () { if (ctrl.signal.aborted) throw new Error('cancelled'); return source.search(media, {}, ctrl.signal); });
+            var request = Promise.resolve().then(function () { if (ctrl.signal.aborted) throw new Error('cancelled'); return source.search(media, { quality: self.options.quality }, ctrl.signal); });
             var work = request.then(function (items) {
                 if (id !== self.session) return [];
                 results = results.concat(items);
@@ -263,7 +320,7 @@
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_timeout', type: 'select', values: { '4000': '4 с', '8000': '8 с', '15000': '15 с' }, default: '8000' }, field: { name: 'Тайм-аут источника' } });
         api.addParam({ component: 'smartbalancer', param: { type: 'button' }, field: { name: 'Очистить историю попыток SmartBalancer' }, onChange: clearHistory });
     };
-    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
+    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, wikimediaSearch: wikimediaSearch, canSearchWikimedia: canSearchWikimedia, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
     if (typeof module !== 'undefined' && module.exports) module.exports = core;
     // Lampa's extension checker recognizes source containing the public Lampa. API.
     // The listener is also required for attaching and cancelling card sessions.
@@ -285,33 +342,33 @@
     function showResults(result, card) {
         var items = result.items.filter(function (i) { return i.status === 'available' || i.status === 'unknown'; });
         var reasons = { unauthorized: 'каталог требует авторизацию', not_found: 'каталог не найден (404)', http_error: 'ошибка сервера каталога', timeout: 'превышено время ожидания', invalid_catalog: 'некорректный JSON-каталог', catalog_too_large: 'каталог превышает 1 МиБ', streaming_unsupported: 'WebView не поддерживает потоковое чтение', unavailable_or_cors: 'сеть, TLS или CORS не позволяют прочитать каталог' };
-        if (!items.length) { notify(result.errors.length ? 'Нет вариантов: ' + (reasons[result.errors[0]] || 'ошибка источника') + '.' : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию.' : 'Совпадений с точным ID и эпизодом нет.'); back(); return; }
-        menu('Источники SmartBalancer', items.map(function (item) { return { title: item.providerId + ' · ' + (item.resolution ? item.resolution + 'p' : 'качество неизвестно') + ' · ' + item.format + ' · ' + item.status + (item.language ? ' · ' + escapeText(item.language) : '') + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация не подтверждена' : ''), action: function () { if (current === card) { back(); play(item); } } }; }));
+        if (!items.length) { notify(result.errors.length ? 'Нет вариантов: ' + (reasons[result.errors[0]] || 'ошибка источника') + '.' : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию.' : 'В доступных источниках нет полного видео для этой карточки.'); back(); return; }
+        menu('Источники SmartBalancer', items.map(function (item) { return { title: (item.providerId === 'wikimedia' ? 'Wikimedia Commons' : item.providerId) + ' · ' + (item.resolution ? item.resolution + 'p' : 'качество неизвестно') + ' · ' + item.format + ' · ' + item.status + (item.license ? ' · ' + escapeText(item.license) : '') + (item.language ? ' · ' + escapeText(item.language) : '') + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация не подтверждена' : ''), action: function () { if (current === card) { back(); play(item); } } }; }));
     }
     function sourceConfig(media) {
         var configured = [read('smartbalancer_catalog1', ''), read('smartbalancer_catalog2', '')];
         var urls = configured.map(function (url) { return safeUrl(url) ? url : null; });
         var open = read('smartbalancer_open_films', true);
-        return { urls: urls, count: urls.filter(Boolean).length, invalid: configured.filter(function (url) { return url && !safeUrl(url); }).length, openFilms: open, hasOpenFilm: Boolean(open && openFilms(media).length) };
+        return { urls: urls, count: urls.filter(Boolean).length, invalid: configured.filter(function (url) { return url && !safeUrl(url); }).length, openFilms: open, hasOpenFilm: Boolean(open && openFilms(media).length), hasWikimedia: canSearchWikimedia(media) };
     }
     function noSources(card, invalid) {
-        var items = [{ title: invalid ? 'Адрес каталога должен быть HTTPS без логина и пароля' : 'Для этого фильма или сериала каталог не подключён', noenter: true }];
+        var items = [{ title: invalid ? 'Адрес дополнительного источника недопустим' : 'Встроенный поиск пока не поддерживает эту карточку', noenter: true }];
         if (bridge.hasOnlineMod(card)) items.push({ title: 'Открыть установленный Online Mod вручную', action: function () { if (current === card) { back(); if (!bridge.openOnlineMod(card)) notify('Online Mod недоступен на этой карточке.'); } } });
         items.push({ title: 'Настройки источников SmartBalancer', action: function () { if (current === card) { back(); settings(); } } });
         items.push({ title: 'Закрыть', action: back });
-        menu('Источники не подключены', items);
+        menu('Нет доступного источника', items);
     }
     function run(media, manual) {
         if (searching) { notify('Поиск уже выполняется.'); return; }
         var config = sourceConfig(media), urls = config.urls, card = current;
         engine.options.openFilms = config.openFilms;
-        if (!config.count && !config.hasOpenFilm) return noSources(card, config.invalid);
+        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia) return noSources(card, config.invalid);
         if (config.invalid) notify('Некорректный URL каталога пропущен; остальные источники будут проверены.');
         engine.options.timeout = Number(read('smartbalancer_timeout', '8000')); engine.options.quality = read('smartbalancer_quality', '1080');
         engine.options.language = String(read('smartbalancer_language', '')).trim(); engine.options.voiceover = String(read('smartbalancer_voiceover', '')).trim();
         searching = true;
         menu('Поиск SmartBalancer', [{ title: 'Отменить поиск', action: function () { engine.cancel(); searching = false; back(); } }], function () { if (!closing) { engine.cancel(); searching = false; back(); } });
-        var count = config.count + (config.hasOpenFilm ? 1 : 0);
+        var count = config.count + (config.hasOpenFilm ? 1 : 0) + (config.hasWikimedia ? 1 : 0);
         engine.search(media, urls, function (checked, found) { if (current === card) notify('Проверено: ' + checked + '/' + count + ', вариантов: ' + found); }, function (item) {
             if (current !== card || !searching || manual || !read('smartbalancer_auto', true) || item.status !== 'available' || item.format === 'mkv' || !item.autoEligible || (engine.options.language && item.language.toLowerCase() !== engine.options.language.toLowerCase()) || (engine.options.voiceover && item.voiceover.toLowerCase() !== engine.options.voiceover.toLowerCase())) return;
             engine.cancel(); searching = false; closing = true; bridge.closeMenu(); closing = false; back(); play(item);
@@ -373,7 +430,7 @@
         var card = current;
         if (!card || searching) return;
         var config = sourceConfig(media);
-        if (!config.count && !config.hasOpenFilm) return noSources(card, config.invalid);
+        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia) return noSources(card, config.invalid);
         if (media.type === 'tv') episode(media, card, function () { if (current === card) run(media, manual); });
         else run(media, manual);
     }
