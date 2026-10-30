@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "type": "movie",
+      "ids": {"tmdb": 45745},
+      "year": 2010,
+      "url": "https://download.blender.org/durian/movies/Sintel.2010.1080p.mkv",
+      "format": "mkv",
+      "resolution": 1080,
+      "language": "en"
+    }
+  ]
+}

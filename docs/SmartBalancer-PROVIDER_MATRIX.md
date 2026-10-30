@@ -1,0 +1,14 @@
+# Матрица источников — 2026-10-30
+
+Тестовая среда: Linux, Chromium 154, Lampa 3.4.4; Android TV/Vimu отсутствуют. `tested-working` означает указанный проверенный путь, а не гарантию на другом устройстве.
+
+| Источник / лицензия | Поиск фильма / серии / resolve / playback | Доступ, CORS и подтверждение | Статус / блокер |
+|---|---|---|---|
+| Встроенный [Big Buck Bunny](https://www.themoviedb.org/movie/10378-big-buck-bunny) / [Mux HLS](https://test-streams.mux.dev/) | Точный TMDB ID 10378; серий нет; прямой HLS | Blender CC BY 3.0; ключ/сервер не нужны; HEAD и HLS с CORS `*`. Реальная карточка TMDB, настоящий плеер Lampa в Chromium: воспроизведение началось (`tests/lampa-live.cjs`) | tested-working **для начала воспроизведения в Chromium**; Vimu и весь фильм не проверены. |
+| Встроенный [Sintel](https://www.themoviedb.org/movie/45745-sintel) / [Internet Archive MP4](https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4) | Точный TMDB ID 45745; серий нет; прямой MP4 | Blender CC BY 3.0; HEAD 200, CORS у финальной ссылки не установлен. В Chromium обычный HTML video начал играть; встроенный плеер Lampa с `crossorigin=anonymous` выдал ошибку | implemented-not-tested во внешнем плеере; Lampa Chromium ограничена CORS. |
+| Пользовательский статический JSON | Точный поиск по ID/эпизоду; URL уже в записи; передача плееру реализована | HTTPS, CORS; аккаунт не поддерживается; HLS/DASH/MP4/MKV без headers | implemented-not-tested с реальным пользовательским каталогом: автоматические тесты и сетевые ответы, перехваченные Chromium. |
+| [Официальный MKV Sintel](https://download.blender.org/durian/movies/Sintel.2010.1080p.mkv) | Пример пользовательского каталога, 1 фильм; серий нет | HEAD 200, CORS не установлен; Range в среде вернул 200 вместо 206 и загрузка прервана | implemented-not-tested: только ручной выбор; воспроизведение не проверено. |
+| [Lampac NextGen](https://github.com/lampac-nextgen/lampac/tree/8ae5c16304ac9a95ba84ca9efe482e14f05d3ee9), AGPL-3.0 | Документация описывает `/lite/{provider}`, ID и эпизоды; прямой URL зависит от провайдера | Нужен отдельный сервер; отдельные источники требуют аккаунт; CORS/HTTPS зависит от инсталляции | unsupported: нет доступного экземпляра/подтверждённого контракта разрешённого потока, адаптер не реализован. |
+| Collaps, Kodik, HDVB, Lumex, CDNVideoHub, Mirage, FanCDN, VideoDB/Videoseed, Filmix, HDRezka, KinoPub | Нет подтверждённого разрешённого прямого контракта для этой сборки | Учётная запись, ключ, подписка и геодоступ зависят от сервиса; не проверены в этой среде | unsupported / unavailable для теста: не подключены; это не утверждение о неработоспособности сервиса. |
+
+Нет подтверждённого сквозного воспроизведения двух независимых источников одного и того же фильма в целевом Vimu. Не извлекаются секреты и потоки из iframe, не обходятся ограничения доступа.
