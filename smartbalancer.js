@@ -1,4 +1,4 @@
-// @lampa-desc: Автоматический поиск открытых видео; доступность зависит от источников.
+// @lampa-desc: Поиск видео по карточке; доступность зависит от источников.
 /* Lampa SmartBalancer — GPL-2.0. No bundled third-party runtime. */
 (function (root) {
     'use strict';
@@ -98,7 +98,7 @@
         } catch (_) { return []; }
     };
     History.prototype.add = function (item) {
-        if (!item.mediaKey || !/^(tmdb:\d+|imdb:tt\d+)$/.test(item.mediaKey) || !/^(catalog-[12]|open-films|wikimedia)$/.test(item.providerId)) return;
+        if (!item.mediaKey || !/^(tmdb:\d+|imdb:tt\d+)$/.test(item.mediaKey) || !/^(catalog-[12]|open-films|wikimedia|reya)$/.test(item.providerId)) return;
         var entries = this.load();
         entries.push({ mediaKey: item.mediaKey, provider: item.providerId, season: Number.isInteger(item.season) ? item.season : null, episode: Number.isInteger(item.episode) ? item.episode : null, event: 'attempted', at: Date.now() });
         try { this.storage.setItem(this.key, JSON.stringify({ version: 1, entries: entries.slice(-50) })); } catch (_) {}
@@ -160,6 +160,32 @@
     }
     function canSearchWikimedia(media) {
         return media.type === 'movie' && !!(media.tmdb || media.imdb) && !!(media.originalTitle || media.title) && media.runtime > 0;
+    }
+    // This public API advertises direct playback by its own relay; no player
+    // code, keys or special HTTP headers are read or forwarded by the plugin.
+    function canSearchReya(media) {
+        return !!media && (media.type === 'movie' || media.type === 'tv') && /^\d+$/.test(String(media.tmdb || ''));
+    }
+    function reyaSearch(media, context, signal) {
+        if (!canSearchReya(media)) return Promise.resolve([]);
+        if (media.type === 'tv' && (!Number.isInteger(media.season) || !Number.isInteger(media.episode) || media.season < 0 || media.episode < 1)) return Promise.resolve([]);
+        var url = 'https://vidnst.reyamika.eu.cc/api/stream?tmdbId=' + encodeURIComponent(media.tmdb) + '&type=' + media.type;
+        if (media.type === 'tv') url += '&season=' + media.season + '&episode=' + media.episode;
+        return fetch(url, { signal: signal, credentials: 'omit', cache: 'no-store' }).then(function (response) {
+            if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? 'unauthorized' : response.status === 404 || response.status === 410 ? 'not_found' : 'http_error');
+            return readCatalog(response, signal);
+        }).then(function (text) {
+            var data; try { data = JSON.parse(text); } catch (_) { throw new Error('invalid_catalog'); }
+            if (!data || String(data.tmdbId) !== String(media.tmdb) || data.mediaType !== media.type || !Array.isArray(data.streams) || data.streams.length > 100) throw new Error('invalid_catalog');
+            if (media.type === 'tv' && (Number(data.season) !== media.season || Number(data.episode) !== media.episode)) throw new Error('invalid_catalog');
+            return data.streams.filter(function (stream) {
+                if (!stream || stream.type !== 'hls' || stream.source !== 'vidsrc' || !safeUrl(stream.url) || stream.drm || stream.cookies) return false;
+                if (stream.headers && (typeof stream.headers !== 'object' || Object.keys(stream.headers).length)) return false;
+                try { var parsed = new URL(stream.url); return parsed.hostname === 'vidnst.reyamika.eu.cc' && parsed.pathname.indexOf('/proxy/') === 0; } catch (_) { return false; }
+            }).map(function (stream) {
+                return normalize(media, { type: media.type, ids: { tmdb: media.tmdb }, year: media.year, season: media.season, episode: media.episode, url: stream.url, format: 'hls', resolution: parseInt(stream.quality, 10) || 0 }, 'reya');
+            }).filter(Boolean).slice(0, 5);
+        });
     }
     function mediaWikiJson(base, params, signal) {
         var query = Object.keys(params).map(function (key) { return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]); }).join('&');
@@ -225,7 +251,7 @@
     SourceRegistry.prototype.enabled = function (media) {
         return this.sources.filter(function (adapter) { try { return !adapter.enabled || adapter.enabled(media); } catch (_) { return false; } });
     };
-    function defaultSources(urls, includeOpenFilms) {
+    function defaultSources(urls, includeOpenFilms, includeReya) {
         var registry = new SourceRegistry();
         urls.slice(0, 2).forEach(function (url, index) {
             if (!safeUrl(url)) return;
@@ -234,14 +260,15 @@
         });
         if (includeOpenFilms) registry.register({ id: 'open-films', enabled: function (media) { return openFilms(media).length > 0; }, search: function (media) { return Promise.resolve(openFilms(media)); } });
         registry.register({ id: 'wikimedia', enabled: canSearchWikimedia, search: wikimediaSearch });
+        if (includeReya !== false) registry.register({ id: 'reya', enabled: canSearchReya, search: reyaSearch });
         return registry;
     }
     function Engine(options) { this.options = options || {}; this.session = 0; this.controllers = []; this.timers = []; this.pending = []; }
     Engine.prototype.cancel = function () { this.session++; this.controllers.forEach(function (c) { c.abort(); }); this.controllers = []; this.pending.forEach(function (stop) { stop(); }); this.pending = []; this.timers.forEach(clearTimeout); this.timers = []; };
     Engine.prototype.search = function (media, urls, progress, onCandidate) {
         var self = this; self.cancel(); var id = self.session, results = [], errors = [], checked = 0;
-        var timeout = Math.max(1000, Math.min(Number(self.options.timeout) || 8000, 30000));
-        var sources = (self.options.registry || defaultSources(urls, self.options.openFilms)).enabled(media);
+        var timeout = Math.max(1000, Math.min(Number(self.options.timeout) || 30000, 30000));
+        var sources = (self.options.registry || defaultSources(urls, self.options.openFilms, self.options.reya)).enabled(media);
         function task(source) {
             var ctrl = new AbortController(); self.controllers.push(ctrl);
             var timer, stop;
@@ -314,13 +341,14 @@
         [1, 2].forEach(function (n) { api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_catalog' + n, type: 'input', values: '', default: '' }, field: { name: 'HTTPS URL каталога ' + n, description: 'Публичный разрешённый JSON-каталог, без секретов' } }); });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_auto', type: 'trigger', default: true }, field: { name: 'Автоматический выбор доступного потока' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_open_films', type: 'trigger', default: true }, field: { name: 'Открытые фильмы Blender (2 фильма)' } });
+        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_reya', type: 'trigger', default: true }, field: { name: 'Поиск через Reya', description: 'Экспериментальный внешний API; передаёт сервису TMDB ID, сезон и серию' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_quality', type: 'select', values: { '720': '720p', '1080': '1080p', '2160': '4K' }, default: '1080' }, field: { name: 'Желаемое качество' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_language', type: 'input', values: '', default: '' }, field: { name: 'Предпочитаемый язык (например ru)' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_voiceover', type: 'input', values: '', default: '' }, field: { name: 'Предпочитаемая озвучка (точное название)' } });
-        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_timeout', type: 'select', values: { '4000': '4 с', '8000': '8 с', '15000': '15 с' }, default: '8000' }, field: { name: 'Тайм-аут источника' } });
+        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_timeout', type: 'select', values: { '4000': '4 с', '8000': '8 с', '15000': '15 с', '30000': '30 с' }, default: '30000' }, field: { name: 'Тайм-аут источника' } });
         api.addParam({ component: 'smartbalancer', param: { type: 'button' }, field: { name: 'Очистить историю попыток SmartBalancer' }, onChange: clearHistory });
     };
-    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, wikimediaSearch: wikimediaSearch, canSearchWikimedia: canSearchWikimedia, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
+    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, wikimediaSearch: wikimediaSearch, canSearchWikimedia: canSearchWikimedia, reyaSearch: reyaSearch, canSearchReya: canSearchReya, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
     if (typeof module !== 'undefined' && module.exports) module.exports = core;
     // Lampa's extension checker recognizes source containing the public Lampa. API.
     // The listener is also required for attaching and cancelling card sessions.
@@ -341,7 +369,7 @@
     function escapeText(value) { return String(value).replace(/[&<>"']/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]; }); }
     function showResults(result, card) {
         var items = result.items.filter(function (i) { return i.status === 'available' || i.status === 'unknown'; });
-        var reasons = { unauthorized: 'каталог требует авторизацию', not_found: 'каталог не найден (404)', http_error: 'ошибка сервера каталога', timeout: 'превышено время ожидания', invalid_catalog: 'некорректный JSON-каталог', catalog_too_large: 'каталог превышает 1 МиБ', streaming_unsupported: 'WebView не поддерживает потоковое чтение', unavailable_or_cors: 'сеть, TLS или CORS не позволяют прочитать каталог' };
+        var reasons = { unauthorized: 'источник требует авторизацию', not_found: 'источник или видео не найдены', http_error: 'ошибка сервера источника', timeout: 'превышено время ожидания', invalid_catalog: 'некорректный ответ источника', catalog_too_large: 'ответ источника превышает 1 МиБ', streaming_unsupported: 'WebView не поддерживает потоковое чтение', unavailable_or_cors: 'сеть, TLS или CORS не позволяют прочитать источник' };
         if (!items.length) { notify(result.errors.length ? 'Нет вариантов: ' + (reasons[result.errors[0]] || 'ошибка источника') + '.' : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию.' : 'В доступных источниках нет полного видео для этой карточки.'); back(); return; }
         menu('Источники SmartBalancer', items.map(function (item) { return { title: (item.providerId === 'wikimedia' ? 'Wikimedia Commons' : item.providerId) + ' · ' + (item.resolution ? item.resolution + 'p' : 'качество неизвестно') + ' · ' + item.format + ' · ' + item.status + (item.license ? ' · ' + escapeText(item.license) : '') + (item.language ? ' · ' + escapeText(item.language) : '') + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация не подтверждена' : ''), action: function () { if (current === card) { back(); play(item); } } }; }));
     }
@@ -349,7 +377,8 @@
         var configured = [read('smartbalancer_catalog1', ''), read('smartbalancer_catalog2', '')];
         var urls = configured.map(function (url) { return safeUrl(url) ? url : null; });
         var open = read('smartbalancer_open_films', true);
-        return { urls: urls, count: urls.filter(Boolean).length, invalid: configured.filter(function (url) { return url && !safeUrl(url); }).length, openFilms: open, hasOpenFilm: Boolean(open && openFilms(media).length), hasWikimedia: canSearchWikimedia(media) };
+        var reya = read('smartbalancer_reya', true);
+        return { urls: urls, count: urls.filter(Boolean).length, invalid: configured.filter(function (url) { return url && !safeUrl(url); }).length, openFilms: open, hasOpenFilm: Boolean(open && openFilms(media).length), hasWikimedia: canSearchWikimedia(media), reya: reya, hasReya: Boolean(reya && canSearchReya(media)) };
     }
     function noSources(card, invalid) {
         var items = [{ title: invalid ? 'Адрес дополнительного источника недопустим' : 'Встроенный поиск пока не поддерживает эту карточку', noenter: true }];
@@ -362,13 +391,14 @@
         if (searching) { notify('Поиск уже выполняется.'); return; }
         var config = sourceConfig(media), urls = config.urls, card = current;
         engine.options.openFilms = config.openFilms;
-        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia) return noSources(card, config.invalid);
+        engine.options.reya = config.reya;
+        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia && !config.hasReya) return noSources(card, config.invalid);
         if (config.invalid) notify('Некорректный URL каталога пропущен; остальные источники будут проверены.');
-        engine.options.timeout = Number(read('smartbalancer_timeout', '8000')); engine.options.quality = read('smartbalancer_quality', '1080');
+        engine.options.timeout = Number(read('smartbalancer_timeout', '30000')); engine.options.quality = read('smartbalancer_quality', '1080');
         engine.options.language = String(read('smartbalancer_language', '')).trim(); engine.options.voiceover = String(read('smartbalancer_voiceover', '')).trim();
         searching = true;
         menu('Поиск SmartBalancer', [{ title: 'Отменить поиск', action: function () { engine.cancel(); searching = false; back(); } }], function () { if (!closing) { engine.cancel(); searching = false; back(); } });
-        var count = config.count + (config.hasOpenFilm ? 1 : 0) + (config.hasWikimedia ? 1 : 0);
+        var count = config.count + (config.hasOpenFilm ? 1 : 0) + (config.hasWikimedia ? 1 : 0) + (config.hasReya ? 1 : 0);
         engine.search(media, urls, function (checked, found) { if (current === card) notify('Проверено: ' + checked + '/' + count + ', вариантов: ' + found); }, function (item) {
             if (current !== card || !searching || manual || !read('smartbalancer_auto', true) || item.status !== 'available' || item.format === 'mkv' || !item.autoEligible || (engine.options.language && item.language.toLowerCase() !== engine.options.language.toLowerCase()) || (engine.options.voiceover && item.voiceover.toLowerCase() !== engine.options.voiceover.toLowerCase())) return;
             engine.cancel(); searching = false; closing = true; bridge.closeMenu(); closing = false; back(); play(item);
@@ -430,7 +460,7 @@
         var card = current;
         if (!card || searching) return;
         var config = sourceConfig(media);
-        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia) return noSources(card, config.invalid);
+        if (!config.count && !config.hasOpenFilm && !config.hasWikimedia && !config.hasReya) return noSources(card, config.invalid);
         if (media.type === 'tv') episode(media, card, function () { if (current === card) run(media, manual); });
         else run(media, manual);
     }
