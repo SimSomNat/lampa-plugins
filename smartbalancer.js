@@ -12,13 +12,51 @@
         if (typeof value !== 'string' || value.length > 4096 || /[\s\x00-\x1f]/.test(value)) return false;
         try { var u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password; } catch (_) { return false; }
     }
-    function mediaFrom(movie, object) {
+    function mediaFrom(movie, object, data) {
         movie = movie || {}; object = object || {};
         var type = object.method === 'tv' || movie.name || movie.first_air_date ? 'tv' : 'movie';
         var date = movie.release_date || movie.first_air_date || '';
         var source = movie.source || object.source;
         var tmdb = movie.tmdb_id || (source === 'tmdb' ? movie.id : null);
-        return { type: type, tmdb: tmdb && String(tmdb), imdb: movie.imdb_id && String(movie.imdb_id), title: String(movie.title || movie.name || ''), year: String(date).slice(0, 4), season: null, episode: null };
+        return { type: type, tmdb: tmdb && String(tmdb), imdb: movie.imdb_id && String(movie.imdb_id), title: String(movie.title || movie.name || ''), year: String(date).slice(0, 4), season: null, episode: null, seasons: seasonMetadata(movie, data) };
+    }
+    function nonnegativeInteger(value) {
+        if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value);
+        return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+    function seasonMetadata(movie, data) {
+        movie = movie || {}; data = data || {};
+        var seasons = [], seen = Object.create(null);
+        if (Array.isArray(movie.seasons)) movie.seasons.forEach(function (season) {
+            var number = season && nonnegativeInteger(season.season_number), count = season && nonnegativeInteger(season.episode_count);
+            if (number === null || number > 9999 || seen[number] || count === 0) return;
+            seen[number] = true;
+            seasons.push({ number: number, count: Number.isInteger(count) && count > 0 && count <= 10000 ? count : null, episodes: [] });
+        });
+        var total = nonnegativeInteger(movie.number_of_seasons);
+        if (!seasons.length && total && total <= 1000) {
+            for (var n = 1; n <= total; n++) seasons.push({ number: n, count: null, episodes: [] });
+        }
+        var details = data.episodes;
+        var detailSeason = details && nonnegativeInteger(details.season_number);
+        if (details && detailSeason !== null && Array.isArray(details.episodes)) {
+            var season = seasons.find(function (entry) { return entry.number === detailSeason; });
+            if (!season && !seen[detailSeason] && detailSeason <= 9999) {
+                season = { number: detailSeason, count: null, episodes: [] }; seasons.push(season);
+            }
+            if (season) season.episodes = exactEpisodes(details, season.number);
+        }
+        return seasons.sort(function (a, b) { return a.number - b.number; });
+    }
+    function exactEpisodes(data, season) {
+        var seen = Object.create(null);
+        var detailSeason = data && nonnegativeInteger(data.season_number);
+        if (!data || !Array.isArray(data.episodes) || (detailSeason !== null && detailSeason !== season)) return [];
+        return data.episodes.filter(function (episode) {
+            var number = episode && nonnegativeInteger(episode.episode_number), episodeSeason = episode && nonnegativeInteger(episode.season_number);
+            if (!episode || number === null || number > 9999 || (episodeSeason !== null && episodeSeason !== season) || seen[number]) return false;
+            seen[number] = true; return true;
+        }).map(function (episode) { return { number: nonnegativeInteger(episode.episode_number), title: String(episode.name || '').slice(0, 120) }; }).sort(function (a, b) { return a.number - b.number; });
     }
     function match(media, item) {
         if (!item || item.type !== media.type || !item.ids || typeof item.ids !== 'object') return false;
@@ -40,7 +78,7 @@
         var format = item.format || (/\.m3u8$/.test(path) ? 'hls' : /\.mpd$/.test(path) ? 'dash' : /\.mp4$/.test(path) ? 'mp4' : /\.mkv$/.test(path) ? 'mkv' : '');
         if (['hls', 'dash', 'mp4', 'mkv'].indexOf(format) < 0) return null;
         var key = media.tmdb && /^\d+$/.test(media.tmdb) ? 'tmdb:' + media.tmdb : media.imdb && /^tt\d+$/.test(media.imdb) ? 'imdb:' + media.imdb : '';
-        return { providerId: provider, title: media.title, url: item.url, format: format, resolution: Number(item.resolution) || 0, language: String(item.language || '').slice(0, 40), voiceover: String(item.voiceover || '').slice(0, 80), status: 'unknown', expiresAt: item.expiresAt || '', autoEligible: media.type !== 'tv' || item.episodeOrder === 'tmdb', mediaKey: key, season: media.season, episode: media.episode };
+        return { providerId: provider, title: media.title, url: item.url, format: format, resolution: Number(item.resolution) || 0, language: String(item.language || '').slice(0, 40), voiceover: String(item.voiceover || '').slice(0, 80), status: 'unknown', expiresAt: item.expiresAt || '', autoEligible: media.type !== 'tv' || (item.episodeOrder === 'tmdb' && media.episodeConfirmed !== false), mediaKey: key, season: media.season, episode: media.episode };
     }
     function rank(items, desired, language, voiceover) {
         var target = Number(desired) || 1080;
@@ -182,12 +220,26 @@
     };
     LampaBridge.prototype.closeMenu = function () { this.api.Select.close(); };
     LampaBridge.prototype.settings = function () {
-        if (this.api.Settings && this.api.Settings.create) this.api.Settings.create('smartbalancer');
-        else this.notify('Откройте настройки SmartBalancer.');
+        var bridge = this;
+        if (!this.api.Settings || !this.api.Settings.create) return this.notify('Откройте настройки SmartBalancer.');
+        try {
+            this.api.Controller.toggle('settings');
+            this.api.Settings.create('smartbalancer', { onBack: function () { bridge.api.Controller.toggle('settings'); bridge.back(); } });
+        } catch (_) { this.back(); this.notify('Не удалось открыть настройки SmartBalancer.'); }
     };
     LampaBridge.prototype.play = function (item) { this.api.Player.play({ url: item.url, title: item.title }); };
     LampaBridge.prototype.follow = function (name, callback) { this.api.Listener.follow(name, callback); };
     LampaBridge.prototype.activeCard = function () { return this.api.Activity && this.api.Activity.active ? this.api.Activity.active() : null; };
+    LampaBridge.prototype.getSeason = function (movie, number, callback) {
+        if (!this.api.Api || typeof this.api.Api.seasons !== 'function') return false;
+        try { this.api.Api.seasons(movie, [number], callback); return true; } catch (_) { return false; }
+    };
+    LampaBridge.prototype.hasOnlineMod = function (object) {
+        try { return Boolean(object && object.activity && object.activity.render().find('.view--online_mod').length); } catch (_) { return false; }
+    };
+    LampaBridge.prototype.openOnlineMod = function (object) {
+        try { var button = object.activity.render().find('.view--online_mod'); if (!button.length) return false; button.first().trigger('hover:enter'); return true; } catch (_) { return false; }
+    };
     LampaBridge.prototype.bindCard = function (object, onEnter, onLong) {
         var body = object.activity.render();
         if (body.find('.smartbalancer-button').length) return;
@@ -202,16 +254,16 @@
         var api = this.api.SettingsApi;
         if (!api) return;
         api.addComponent({ component: 'smartbalancer', name: 'SmartBalancer', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>' });
-        [1, 2].forEach(function (n) { api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_catalog' + n, type: 'input', default: '' }, field: { name: 'HTTPS URL каталога ' + n, description: 'Публичный разрешённый JSON-каталог, без секретов' } }); });
+        [1, 2].forEach(function (n) { api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_catalog' + n, type: 'input', values: '', default: '' }, field: { name: 'HTTPS URL каталога ' + n, description: 'Публичный разрешённый JSON-каталог, без секретов' } }); });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_auto', type: 'trigger', default: true }, field: { name: 'Автоматический выбор доступного потока' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_open_films', type: 'trigger', default: true }, field: { name: 'Открытые фильмы Blender (2 фильма)' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_quality', type: 'select', values: { '720': '720p', '1080': '1080p', '2160': '4K' }, default: '1080' }, field: { name: 'Желаемое качество' } });
-        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_language', type: 'input', default: '' }, field: { name: 'Предпочитаемый язык (например ru)' } });
-        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_voiceover', type: 'input', default: '' }, field: { name: 'Предпочитаемая озвучка (точное название)' } });
+        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_language', type: 'input', values: '', default: '' }, field: { name: 'Предпочитаемый язык (например ru)' } });
+        api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_voiceover', type: 'input', values: '', default: '' }, field: { name: 'Предпочитаемая озвучка (точное название)' } });
         api.addParam({ component: 'smartbalancer', param: { name: 'smartbalancer_timeout', type: 'select', values: { '4000': '4 с', '8000': '8 с', '15000': '15 с' }, default: '8000' }, field: { name: 'Тайм-аут источника' } });
         api.addParam({ component: 'smartbalancer', param: { type: 'button' }, field: { name: 'Очистить историю попыток SmartBalancer' }, onChange: clearHistory });
     };
-    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
+    var core = { safeUrl: safeUrl, mediaFrom: mediaFrom, seasonMetadata: seasonMetadata, exactEpisodes: exactEpisodes, match: match, normalize: normalize, rank: rank, Engine: Engine, validate: validate, readCatalog: readCatalog, openFilms: openFilms, History: History, SourceRegistry: SourceRegistry, defaultSources: defaultSources };
     if (typeof module !== 'undefined' && module.exports) module.exports = core;
     // Lampa's extension checker recognizes source containing the public Lampa. API.
     // The listener is also required for attaching and cancelling card sessions.
@@ -236,20 +288,30 @@
         if (!items.length) { notify(result.errors.length ? 'Нет вариантов: ' + (reasons[result.errors[0]] || 'ошибка источника') + '.' : result.items.length ? 'Найденные варианты недоступны или требуют авторизацию.' : 'Совпадений с точным ID и эпизодом нет.'); back(); return; }
         menu('Источники SmartBalancer', items.map(function (item) { return { title: item.providerId + ' · ' + (item.resolution ? item.resolution + 'p' : 'качество неизвестно') + ' · ' + item.format + ' · ' + item.status + (item.language ? ' · ' + escapeText(item.language) : '') + (item.voiceover ? ' · ' + escapeText(item.voiceover) : '') + (!item.autoEligible ? ' · нумерация не подтверждена' : ''), action: function () { if (current === card) { back(); play(item); } } }; }));
     }
-    function run(media, manual) {
-        if (searching) { notify('Поиск уже выполняется.'); return; }
+    function sourceConfig(media) {
         var configured = [read('smartbalancer_catalog1', ''), read('smartbalancer_catalog2', '')];
         var urls = configured.map(function (url) { return safeUrl(url) ? url : null; });
-        var configuredCount = urls.filter(Boolean).length;
-        var invalidCount = configured.filter(function (url) { return url && !safeUrl(url); }).length;
-        engine.options.openFilms = read('smartbalancer_open_films', true);
-        if (!configuredCount && !(engine.options.openFilms && openFilms(media).length)) { notify(invalidCount ? 'URL каталога должен быть HTTPS без логина и пароля.' : 'Для этого фильма нет подключённых каталогов. Укажите HTTPS URL в настройках.'); settings(); return; }
-        if (invalidCount) notify('Некорректный URL каталога пропущен; остальные источники будут проверены.');
+        var open = read('smartbalancer_open_films', true);
+        return { urls: urls, count: urls.filter(Boolean).length, invalid: configured.filter(function (url) { return url && !safeUrl(url); }).length, openFilms: open, hasOpenFilm: Boolean(open && openFilms(media).length) };
+    }
+    function noSources(card, invalid) {
+        var items = [{ title: invalid ? 'Адрес каталога должен быть HTTPS без логина и пароля' : 'Для этого фильма или сериала каталог не подключён', noenter: true }];
+        if (bridge.hasOnlineMod(card)) items.push({ title: 'Открыть установленный Online Mod вручную', action: function () { if (current === card) { back(); if (!bridge.openOnlineMod(card)) notify('Online Mod недоступен на этой карточке.'); } } });
+        items.push({ title: 'Настройки источников SmartBalancer', action: function () { if (current === card) { back(); settings(); } } });
+        items.push({ title: 'Закрыть', action: back });
+        menu('Источники не подключены', items);
+    }
+    function run(media, manual) {
+        if (searching) { notify('Поиск уже выполняется.'); return; }
+        var config = sourceConfig(media), urls = config.urls, card = current;
+        engine.options.openFilms = config.openFilms;
+        if (!config.count && !config.hasOpenFilm) return noSources(card, config.invalid);
+        if (config.invalid) notify('Некорректный URL каталога пропущен; остальные источники будут проверены.');
         engine.options.timeout = Number(read('smartbalancer_timeout', '8000')); engine.options.quality = read('smartbalancer_quality', '1080');
         engine.options.language = String(read('smartbalancer_language', '')).trim(); engine.options.voiceover = String(read('smartbalancer_voiceover', '')).trim();
-        searching = true; var card = current;
+        searching = true;
         menu('Поиск SmartBalancer', [{ title: 'Отменить поиск', action: function () { engine.cancel(); searching = false; back(); } }], function () { if (!closing) { engine.cancel(); searching = false; back(); } });
-        var count = configuredCount + (engine.options.openFilms && openFilms(media).length ? 1 : 0);
+        var count = config.count + (config.hasOpenFilm ? 1 : 0);
         engine.search(media, urls, function (checked, found) { if (current === card) notify('Проверено: ' + checked + '/' + count + ', вариантов: ' + found); }, function (item) {
             if (current !== card || !searching || manual || !read('smartbalancer_auto', true) || item.status !== 'available' || item.format === 'mkv' || !item.autoEligible || (engine.options.language && item.language.toLowerCase() !== engine.options.language.toLowerCase()) || (engine.options.voiceover && item.voiceover.toLowerCase() !== engine.options.voiceover.toLowerCase())) return;
             engine.cancel(); searching = false; closing = true; bridge.closeMenu(); closing = false; back(); play(item);
@@ -262,27 +324,56 @@
         });
     }
     function episode(media, card, cb) {
-        function choices(title, max, next) {
-            var items = [];
-            for (var n = 0; n <= max; n++) (function (value) {
-                items.push({ title: String(value), action: function () { if (current === card) next(value); } });
-            }(n));
-            menu(title, items);
+        var seasons = media.seasons || [];
+        function selectEpisodes(season, episodes, confirmed) {
+            if (current !== card) return;
+            if (!episodes.length) { notify('Список серий для этого сезона недоступен.'); back(); return; }
+            var title = confirmed ? 'Выберите серию · сезон ' + season.number : 'Серии по числу в карточке · сезон ' + season.number;
+            menu(title, episodes.map(function (episode) {
+                return { title: String(episode.number) + (episode.title ? ' · ' + escapeText(episode.title) : ''), action: function () {
+                    if (current === card) { media.season = season.number; media.episode = episode.number; media.episodeConfirmed = confirmed; cb(); }
+                } };
+            }));
         }
-        function selectSeason() { choices('Выберите сезон (0 — специальные выпуски)', 30, function (season) {
-            choices('Выберите серию', 100, function (number) { media.season = season; media.episode = number; cb(); });
-        }); }
+        function chooseSeason(season) {
+            if (current !== card) return;
+            if (season.episodes.length) return selectEpisodes(season, season.episodes, true);
+            var active = true, timer;
+            function cancel() { if (!active) return; active = false; clearTimeout(timer); back(); }
+            function done(response) {
+                if (!active || current !== card) return;
+                active = false; clearTimeout(timer); bridge.closeMenu();
+                var detail = response && (response[String(season.number)] || response);
+                var episodes = exactEpisodes(detail, season.number), confirmed = episodes.length > 0;
+                if (confirmed) season.episodes = episodes;
+                else if (season.count) for (var n = 1; n <= season.count; n++) episodes.push({ number: n, title: '' });
+                selectEpisodes(season, episodes, confirmed);
+            }
+            menu('Загрузка серий сезона ' + season.number, [{ title: 'Отменить', action: cancel }], cancel);
+            timer = setTimeout(function () { done(null); }, 5000);
+            if (!bridge.getSeason(card.card || {}, season.number, done)) done(null);
+        }
+        function selectSeason() {
+            if (!seasons.length) { notify('Lampa не предоставила список сезонов этого сериала.'); back(); return; }
+            if (seasons.length === 1) return chooseSeason(seasons[0]);
+            menu('Выберите сезон', seasons.map(function (season) { return { title: 'Сезон ' + season.number + (season.number === 0 ? ' · специальные выпуски' : '') + (season.count ? ' · серий: ' + season.count : ''), action: function () { chooseSeason(season); } }; }));
+        }
         var key = media.tmdb && /^\d+$/.test(media.tmdb) ? 'tmdb:' + media.tmdb : media.imdb && /^tt\d+$/.test(media.imdb) ? 'imdb:' + media.imdb : '';
-        var last = history.load().reverse().find(function (entry) { return entry.mediaKey === key && Number.isInteger(entry.season) && Number.isInteger(entry.episode); });
+        var last = history.load().reverse().find(function (entry) {
+            var season = seasons.find(function (candidate) { return candidate.number === entry.season; });
+            return entry.mediaKey === key && season && season.episodes.some(function (candidate) { return candidate.number === entry.episode; });
+        });
         if (!last) return selectSeason();
         menu('Выбор серии', [
-            { title: 'Последняя попытка: сезон ' + last.season + ', серия ' + last.episode, action: function () { if (current === card) { media.season = last.season; media.episode = last.episode; cb(); } } },
+            { title: 'Последняя попытка: сезон ' + last.season + ', серия ' + last.episode, action: function () { if (current === card) { media.season = last.season; media.episode = last.episode; media.episodeConfirmed = true; cb(); } } },
             { title: 'Выбрать другую серию', action: function () { if (current === card) selectSeason(); } }
         ]);
     }
     function begin(media, manual) {
         var card = current;
         if (!card || searching) return;
+        var config = sourceConfig(media);
+        if (!config.count && !config.hasOpenFilm) return noSources(card, config.invalid);
         if (media.type === 'tv') episode(media, card, function () { if (current === card) run(media, manual); });
         else run(media, manual);
     }
@@ -308,7 +399,7 @@
         }
         if (e.type !== 'complite' || !e.data || !e.data.movie || !e.object || !e.object.activity) return;
         if ((bridge.activeCard() && bridge.activeCard() !== e.object) || (current && current !== e.object)) return;
-        current = e.object; currentMedia = mediaFrom(e.data.movie, e.object);
+        current = e.object; currentMedia = mediaFrom(e.data.movie, e.object, e.data);
         bridge.bindCard(e.object, function () { if (current === e.object && currentMedia) begin(currentMedia, false); }, function () { if (current === e.object && currentMedia) cardMenu(currentMedia); });
     });
     bridge.follow('activity', function (e) {
